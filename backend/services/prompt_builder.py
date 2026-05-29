@@ -348,10 +348,10 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
         # 婵犵數濮烽弫鍛婃叏閻戝鈧倹绂掔€ｎ亞鍔﹀銈嗗坊閸嬫捇鏌涢悢閿嬪仴闁糕斁鍋撳銈嗗坊閸嬫挾绱撳鍜冭含妤犵偛鍟灒閻犲洩灏欑粣鐐烘煟鎼搭垳鍒板褍娴锋竟鏇熴偅閸愨斁鎷洪梺鍛婄箓鐎氼喛鈪归梻浣告啞閺屻劎绮旇ぐ鎺戠?user 闂傚倷娴囬褍顫濋敃鍌︾稏濠㈣埖鍔栭崑銈夋煛閸モ晛小闁绘帒锕ョ换娑㈠幢濡櫣浠撮梺鎼炲妽缁诲牓寮婚妸鈺傚亜闁告繂瀚呴姀銈嗙厵?recent 闂傚倸鍊搁崐鎼佸磹閻戣姤鍊块柨鏇氶檷娴滃綊鏌涢幇闈涙灍闁搞倖鍔栭妵鍕冀閵娿儱姣堝┑鐐茬毞閺呯娀寮婚弴鐔虹闁绘劦鍓氶悵鏃傜磽娴ｆ彃浜鹃梺绯曞墲鑿уù婊勭矒閺岀喖寮堕崹顕呮殺闂佷紮缍€妞村摜鎹㈠☉銏犲窛妞ゆ劑鍨绘禒鐓庮渻?
         if first_user is not None and first_user not in recent_messages:
             messages = system_messages + [first_user] + recent_messages
-            log.info(f"[Prompt] 闂傚倸鍊搁崐宄懊归崶顒婄稏濠㈣埖鍔曠粻姘舵倶閻愭彃鈷旀い鈺佸级缁绘繈妫冨☉鍗炲壈闂佽棄鍟伴崰鏍蓟濞戙垹唯妞ゆ梻鍘ч～鈺呮⒑缁嬭儻顫﹂柛鏃€鍨垮璇测槈閵忕姷鍔撮梺鍛婂姉閸嬫捇鎮鹃崼鏇熲拺闁兼亽鍎遍悘銉︺亜閿旂偓鏆€殿喖顭锋俊鎼佸Ψ閵忊槅娼旀繝鐢靛仜濡瑩宕硅ぐ鎺戠煑婵犻潧鐗忕壕钘壝归敐鍫燁仩閻㈩垱绋撻埀顒€鍘滈崑鎾绘煙闂傚顦︾紒?system + 婵犵數濮烽。钘壩ｉ崨鏉戠；闁规崘娉涚欢銈呂旈敐鍛殲闁稿顑嗘穱濠囧Χ閸屾矮澹曟俊鐐€ら崢鐓幟洪顫偓浣糕槈濡攱顫嶅┑顔矫崥瀣矈椤愶附鈷戦柤濮愬€曞瓭濠电偠顕滅粻鎺楀Φ閹版澘绀冩い鏇炴缁?+ 闂傚倸鍊搁崐椋庣矆娓氣偓楠炴牠顢曢敂钘変罕闂佸憡鍔﹂崰鏍婵犳碍鐓欓柟瑙勫姦閸ゆ瑧绱?{MAX_HISTORY_TURNS} 闂?(闂?{len(messages)} 闂?")
+            log.info(f"[Prompt] trimmed history with system+original user+last {MAX_HISTORY_TURNS} turns (messages={len(messages)})")
         else:
             messages = system_messages + recent_messages
-            log.info(f"[Prompt] 闂傚倸鍊搁崐宄懊归崶顒婄稏濠㈣埖鍔曠粻姘舵倶閻愭彃鈷旀い鈺佸级缁绘繈妫冨☉鍗炲壈闂佽棄鍟伴崰鏍蓟濞戙垹唯妞ゆ梻鍘ч～鈺呮⒑缁嬭儻顫﹂柛鏃€鍨垮璇测槈閵忕姷鍔撮梺鍛婂姉閸嬫捇鎮鹃崼鏇熲拺闁兼亽鍎遍悘銉︺亜閿旂偓鏆€殿喖顭锋俊鎼佸Ψ閵忊槅娼旀繝鐢靛仜濡瑩宕硅ぐ鎺戠煑婵犻潧鐗忕壕钘壝归敐鍫燁仩閻㈩垱绋撻埀顒€鍘滈崑鎾绘煙闂傚顦︾紒?system + 闂傚倸鍊搁崐椋庣矆娓氣偓楠炴牠顢曢敂钘変罕闂佸憡鍔﹂崰鏍婵犳碍鐓欓柟瑙勫姦閸ゆ瑧绱?{MAX_HISTORY_TURNS} 闂?(闂?{len(messages)} 闂?")
+            log.info(f"[Prompt] trimmed history with system+last {MAX_HISTORY_TURNS} turns (messages={len(messages)})")
 
     MAX_CHARS = 40000 if tools else 120000
     sys_part = "" if tools and client_profile == CLAUDE_CODE_OPENAI_PROFILE else (f"<system>\n{system_prompt[:2000]}\n</system>" if system_prompt else "")
@@ -415,7 +415,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
             text = "\n".join(tc_parts)
 
         if tools and role == "assistant" and any(m in text for m in NEEDSREVIEW_MARKERS):
-            log.debug(f"[Prompt] 闂傚倸鍊峰ù鍥х暦閸偅鍙忛柟缁㈠枛缁犺銇勯幇鍫曟闁稿浜弻娑㈠Ψ閵忊剝鐝曢悗瑙勬礃閻擄繝寮诲☉銏犵疀闂傚牊绋掗悘宥咁渻閵堝啫鍔氭俊顐ｇ箞瀵顓奸崼顐ｎ€囬梻浣告啞閹稿鎮烽敃鍌氱柧闁靛鏅滈埛鎴犵磼鐎ｎ偄顕滄繝鈧幍顔炬／闁哄娉曡倴缂備緡鍠栭悧鎾诲春閳ь剚銇勯幒鎴濐仾闁抽攱鍨块弻娑樷攽閸℃浠煎銈呮禋娴滎亪寮诲☉娆愬劅闁挎稑瀚哥槐鐐测攽?assistant 濠电姷鏁告慨鐑藉极閹间礁纾婚柣鎰惈閸ㄥ倿鏌ｉ姀鐘冲暈闁稿顑呴埞鎴︽偐閹绘帗娈?({len(text)}闂?")
+            log.debug(f"[Prompt] skipped assistant needs-review marker message (chars={len(text)})")
             msg_count += 1
             continue
         lower_text = text.lower()
@@ -467,7 +467,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
                         used -= len(removed) + 2
                     history_parts.insert(0, first_line)
                     used += first_line_cost
-                    log.info(f"[Prompt] 闂傚倸鍊搁崐宄懊归崶顒夋晪闁哄稁鍘奸崒銊ф喐閻楀牆绗掗柛銊ュ€婚幉鎼佹偋閸繂鎯為梺鎼炲労閸撴瑩鎷戦悢鍏肩厪濠㈣泛鐗嗛崝姘舵煕鐎ｎ亞效婵﹨娅ｇ槐鎺懳熼懡銈呭汲婵＄偑鍊戦崝灞绢殽閹间讲鈧箓宕堕‖顒佹閸┾偓妞ゆ帒瀚粻鎺楁⒒娴ｈ櫣甯涢惇澶愭偣閳ь剟鏁冮崒姘優濠电偛妫楃换鍡涘绩閼恒儯浜滈柡鍐ｅ亾闁稿孩濞婂鎼佸箣閻樼數锛滈柣搴秵娴滆泛危閸︻厾纾肩紓浣诡焽缁犳牠鏌熷畡鐗堝殗闁圭厧婀遍幉鎾礋椤愶絾顔掗梻?({len(first_short)} chars)")
+                    log.info(f"[Prompt] injected original task summary into history (chars={len(first_short)})")
 
 
     latest_user_line = ""
@@ -508,7 +508,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
                     220,
                 )
         log.debug(
-            "[Prompt] 闂傚倷娴囬褍顫濋敃鍌︾稏濠㈣埖鍔曠粻鏍煕椤愶絾绀€缁炬儳娼″娲敆閳ь剛绮旈幘顔藉剹婵°倕鎳忛悡鏇熴亜椤撶喎鐏ラ柡鍡楅叄閺岋綁寮崒姘粯闂佽绻愮壕顓㈠焵椤掑喚娼愭繛鍙夌墪鐓ら柕濞炬杺閳? history_msgs=%s history_chars=%s tool_count=%s tool_names=%s first_user=%r latest_user=%r tool_instr=%r",
+            "[Prompt] history summary: history_msgs=%s history_chars=%s tool_count=%s tool_names=%s first_user=%r latest_user=%r tool_instr=%r",
             len(history_parts),
             used,
             len(tool_names),
@@ -643,7 +643,7 @@ def _build_state_followup_notice(messages, tools, client_profile) -> str:
     if not read_done or write_done:
         return ""
     return (
-        "[STATE NOTICE 闂?MUST OBEY]\n"
+        "[STATE NOTICE: MUST OBEY]\n"
         "The user's CURRENT TASK explicitly requires TWO operations: reading AND writing/editing.\n"
         "You have ALREADY completed the read (the file content is in the history above).\n"
         f"Your NEXT output MUST be a {to_qwen_name('Write')}/{to_qwen_name('Edit')} tool call in the required QNML format.\n"
@@ -653,7 +653,7 @@ def _build_state_followup_notice(messages, tools, client_profile) -> str:
 
 
 def _extract_text_content(content) -> str:
-    """Flatten Anthropic content array/string 闂?plain text."""
+    """Flatten Anthropic content array/string into plain text."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):

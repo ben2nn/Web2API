@@ -158,7 +158,8 @@ def build_workspace_notice(workspace_root: str | None) -> str:
         f"Current project workspace root: {workspace_root}\n"
         "Resolve relative file paths under this root. Prefer file paths inside this root for Read/Write/Edit/Grep/Glob.\n"
         "Do not use stale paths from previous conversations or unrelated Desktop/Temp folders unless the current user explicitly asks for them.\n"
-        "For shell commands, start from this workspace root or use absolute paths inside it.\n"
+        "For shell commands, assume the command already starts in this workspace; prefer relative paths and do not emit `cd` into a Windows drive path.\n"
+        "Only use an absolute shell path when a previous tool result proves that exact path works in the shell environment.\n"
         "[/WORKSPACE ROOT]"
     )
 

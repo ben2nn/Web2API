@@ -754,7 +754,7 @@ async def collect_completion_run(
     tool_sieve = None
     if request.tools:
         tool_sieve = tool_parser.ToolSieve(request.tool_names)
-        log.info("[鏀堕泦瀹屾垚] 宸ュ叿杩囨护鍣ㄥ凡鍚敤锛屽伐鍏峰垪琛? %s", request.tool_names)
+        log.info("[Collect] tool filter enabled: tools=%s", request.tool_names)
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         answer_text = "".join(answer_fragments)
@@ -792,7 +792,7 @@ async def collect_completion_run(
                         final_finish_reason = "tool_calls"
                         _log_tool_calls("tool_sieve_flush", detected_tool_calls)
                         log.info(
-                            "[Collect] 鉁?Tool Sieve 鍒锋柊妫€娴嬪埌宸ュ叿璋冪敤: tools=%s",
+                            "[Collect] Tool Sieve flush detected tool calls: tools=%s",
                             [t.get("name") for t in detected_tool_calls],
                         )
                         break
@@ -847,7 +847,7 @@ async def collect_completion_run(
                     answer_text = ""
 
                 log.info(
-                    "[Collect] 鉁?鏈€缁堟枃鏈В鏋愭娴嬪埌宸ュ叿璋冪敤: tools=%s, cleaned_text_len=%s",
+                    "[Collect] final text parser detected tool calls: tools=%s, cleaned_text_len=%s",
                     [t.get("name") for t in detected_tool_calls],
                     len(answer_text),
                 )
@@ -865,7 +865,7 @@ async def collect_completion_run(
             final_finish_reason = "invalid_tool_args"
         if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
             log.warning(
-                "[鏀堕泦瀹屾垚] 涓婃父杩斿洖绌鸿緭鍑? 鍘熷洜=%s 浼氳瘽=%s",
+                "[Collect] upstream returned empty output: reason=%s chat_id=%s",
                 reason,
                 chat_id,
             )
@@ -883,7 +883,7 @@ async def collect_completion_run(
 
         if reason:
             log.info(
-                "[鏀堕泦瀹屾垚] 鍘熷洜=%s 浼氳瘽=%s 宸ュ叿璋冪敤=%s 绛斿瀛楁暟=%s 鎺ㄧ悊瀛楁暟=%s 缁撴潫鍘熷洜=%s",
+                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s finish_reason=%s",
                 reason,
                 chat_id,
                 len(detected_tool_calls),
@@ -961,7 +961,7 @@ async def collect_completion_run(
                     toxic_blocked = extract_blocked_tool_names(early_answer, request.tool_names)
                     blocked_name = toxic_blocked[0] if toxic_blocked else "unknown"
                     log.warning(
-                        "[鏀堕泦瀹屾垚] 姹℃煋鎷︽埅 %r (鏈祦鍑哄鎴风锛岃Е鍙戦噸璇?",
+                        "[Collect] blocked contaminated output before client stream: preview=%r",
                         early_answer[:80],
                     )
                     return _finalize_result(reason=f"blocked_tool_name:{blocked_name}")
