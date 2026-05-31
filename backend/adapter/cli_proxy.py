@@ -8,6 +8,7 @@ from typing import Any
 from backend.adapter.standard_request import StandardRequest, CLAUDE_CODE_OPENAI_PROFILE
 from backend.core.config import resolve_model
 from backend.services.prompt_builder import messages_to_prompt
+from backend.services.workspace_context import derive_workspace_root
 from backend.toolcall.normalize import build_tool_name_registry
 
 log = logging.getLogger("qwen2api.cli_proxy")
@@ -32,6 +33,8 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "gpt-4o")
+        workspace_root = derive_workspace_root(req_data)
+        req_data = {**req_data, "_workspace_root": workspace_root}
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -53,6 +56,7 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            workspace_root=workspace_root,
         )
 
     @staticmethod
@@ -68,6 +72,8 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "claude-3-5-sonnet")
+        workspace_root = derive_workspace_root(req_data)
+        req_data = {**req_data, "_workspace_root": workspace_root}
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -89,6 +95,7 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            workspace_root=workspace_root,
         )
 
     @staticmethod

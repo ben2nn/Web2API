@@ -1,24 +1,31 @@
-import { useState, useEffect } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Settings2, RefreshCw, KeyRound, ServerCrash, Code } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 
+type ModelAliases = Record<string, string>
+
+interface AdminSettings {
+  version?: string
+  max_inflight_per_account?: number
+  global_max_inflight?: number
+  chat_id_pool_target?: number
+  chat_id_pool_ttl_seconds?: number
+  model_aliases?: ModelAliases
+}
+
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<any>(null)
-  const [sessionKey, setSessionKey] = useState("")
+  const [settings, setSettings] = useState<AdminSettings | null>(null)
+  const [sessionKey, setSessionKey] = useState(() => localStorage.getItem("qwen2api_key") || "")
   const [maxInflight, setMaxInflight] = useState(4)
   const [globalMaxInflight, setGlobalMaxInflight] = useState(0)
   const [poolTarget, setPoolTarget] = useState(5)
   const [poolTtlMin, setPoolTtlMin] = useState(10)
   const [modelAliases, setModelAliases] = useState("")
 
-  const loadSessionKey = () => {
-    setSessionKey(localStorage.getItem('qwen2api_key') || "")
-  }
-
-  const fetchSettings = () => {
+  const fetchSettings = useCallback(() => {
     fetch(`${API_BASE}/api/admin/settings`, { headers: getAuthHeader() })
       .then(res => {
         if(!res.ok) throw new Error("Unauthorized")
@@ -33,12 +40,11 @@ export default function SettingsPage() {
         setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
       })
       .catch(() => toast.error("配置获取失败，请检查会话 Key"))
-  }
+  }, [])
 
   useEffect(() => {
-    loadSessionKey()
     fetchSettings()
-  }, [])
+  }, [fetchSettings])
 
   const handleSaveSessionKey = () => {
     if (!sessionKey.trim()) {
@@ -95,7 +101,7 @@ export default function SettingsPage() {
         if(res.ok) { toast.success("模型映射规则已更新"); fetchSettings(); }
         else toast.error("保存失败")
       })
-    } catch(e) {
+    } catch {
       toast.error("JSON 格式错误，请检查语法")
     }
   }

@@ -82,6 +82,7 @@ async def run_retryable_completion_bridge(
             current_prompt,
             capture_events=capture_events,
             on_delta=on_delta,
+            history_messages=history_messages,
         )
         retry = evaluate_retry_directive(
             request=standard_request,
@@ -126,3 +127,4 @@ async def run_retryable_completion_bridge(
         )
 
     raise RuntimeError("Retryable completion bridge exhausted attempts")
+

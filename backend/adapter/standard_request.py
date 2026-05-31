@@ -36,3 +36,6 @@ class StandardRequest:
     persistent_session: bool = False
     session_message_hashes: list[str] = field(default_factory=list)
     session_chat_invalidated: bool = False
+    workspace_root: str | None = None
+    retry_blocked_tools: list[str] = field(default_factory=list)
+    retry_read_blocklist: list[str] = field(default_factory=list)

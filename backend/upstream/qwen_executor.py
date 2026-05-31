@@ -19,11 +19,16 @@ class QwenExecutor:
         self.auth_resolver = AuthResolver(account_pool) if account_pool is not None else None
         # 会在 app 启动时被 main.py 注入；若未注入则为 None，走同步 create_chat
         self.chat_id_pool = None
+        self._active_chat_ids: set[str] = set()
 
-    async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
+    def active_chat_ids(self) -> set[str]:
+        """Return upstream chat IDs currently used by in-flight streams."""
+        return set(self._active_chat_ids)
+
+    async def create_chat(self, token: str, model: str, chat_type: str = "t2t", *, use_prewarmed: bool = True) -> str:
         # 预热池快路径：如果能从池里拿到一个已预建的 chat_id 直接用
         # 需要 token 反查 email（通过 account_pool）
-        if self.chat_id_pool is not None and self.account_pool is not None:
+        if use_prewarmed and self.chat_id_pool is not None and self.account_pool is not None:
             try:
                 acc = next((a for a in self.account_pool.accounts if a.token == token), None)
                 if acc is not None:
@@ -118,11 +123,16 @@ class QwenExecutor:
         log.info(f"[上游] 功能配置: function_calling={feature_config.get('function_calling')} auto_search={feature_config.get('auto_search')} code_interpreter={feature_config.get('code_interpreter')} plugins_enabled={feature_config.get('plugins_enabled')}")
 
         prompt_content = payload.get("messages", [{}])[0].get("content", "")
-        if "##TOOL_CALL##" in prompt_content:
-            log.info(f"[上游] prompt 包含 ##TOOL_CALL## 标记（正常）")
-        else:
-            log.warning(f"[上游] prompt 缺少 ##TOOL_CALL## 标记 — 可能导致上游拦截")
-        log.info(f"[上游] prompt 前 500 字预览: {prompt_content[:500]}")
+        if has_custom_tools:
+            tool_marker_present = any(
+                marker in prompt_content
+                for marker in ("<|QNML|tool_calls", "<|QNML|invoke", "<tool_calls", "<invoke", "##TOOL_CALL##")
+            )
+            if tool_marker_present:
+                log.debug("[Upstream] prompt contains QNML/legacy tool markers")
+            else:
+                log.warning("[Upstream] prompt missing QNML tool markers; upstream may block")
+        log.debug(f"[Upstream] prompt preview first 500 chars: {prompt_content[:500]}")
 
         try:
             async for chunk_result in stream_fn(token, chat_id, payload):
@@ -189,14 +199,18 @@ class QwenExecutor:
             try:
                 log.info(f"[上游] 使用指定账号 账号={acc.email} 模型={model}")
                 chat_id = existing_chat_id or await self.create_chat(acc.token, model)
+                self._active_chat_ids.add(chat_id)
                 update_request_context(chat_id=chat_id)
                 if existing_chat_id:
                     log.info(f"[上游] 复用会话 会话={chat_id} 账号={acc.email}")
                 else:
                     log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email}")
-                yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
-                    yield {"type": "event", "event": evt}
+                try:
+                    yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                    async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                        yield {"type": "event", "event": evt}
+                finally:
+                    self._active_chat_ids.discard(chat_id)
                 return
             except Exception:
                 self.account_pool.release(acc)
@@ -214,13 +228,17 @@ class QwenExecutor:
                 log.info(f"[上游] 账号已获取 账号={acc.email} 模型={model} 第{attempt + 1}次 获取耗时={acquire_elapsed:.3f}s")
                 create_start = time.perf_counter()
                 chat_id = await self.create_chat(acc.token, model)
+                self._active_chat_ids.add(chat_id)
                 create_elapsed = time.perf_counter() - create_start
                 update_request_context(chat_id=chat_id)
                 log.info(f"[上游] 创建会话 会话={chat_id} 账号={acc.email} 耗时={create_elapsed:.3f}s")
-                yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                try:
+                    yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
-                    yield {"type": "event", "event": evt}
+                    async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                        yield {"type": "event", "event": evt}
+                finally:
+                    self._active_chat_ids.discard(chat_id)
                 return
 
             except Exception as e:

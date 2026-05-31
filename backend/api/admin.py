@@ -187,27 +187,25 @@ async def register_new_account(request: Request):
 
 @router.post("/verify", dependencies=[Depends(verify_admin)])
 async def verify_all_accounts(request: Request):
-    """验证所有账号的有效性 (完全复原单文件逻辑)"""
+    """逐个到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
     from backend.core.account_pool import AccountPool
     from backend.services.qwen_client import QwenClient
-    import logging
 
-    log = logging.getLogger("qwen2api.admin")
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
     results = []
     for acc in pool.accounts:
-        is_valid = await client.verify_token(acc.token)
-        if not is_valid and acc.password:
-            log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
-            is_valid = await client.auth_resolver.refresh_token(acc)
+        results.append(await client.verify_account(acc))
 
-        acc.valid = is_valid
-        results.append({"email": acc.email, "valid": is_valid, "refreshed": not is_valid})
-
-    await pool.save() # 直接保存全部状态，不调用 mark_invalid 以免熔断影响测试
-    return {"ok": True, "results": results}
+    summary = {
+        "total": len(results),
+        "valid": sum(1 for item in results if item.get("valid")),
+        "refreshed": sum(1 for item in results if item.get("refreshed")),
+        "banned": sum(1 for item in results if item.get("status_code") == "banned"),
+        "failed": sum(1 for item in results if not item.get("valid")),
+    }
+    return {"ok": True, "results": results, "summary": summary, "concurrency": 1}
 
 @router.post("/accounts/{email}/activate", dependencies=[Depends(verify_admin)])
 async def activate_account(email: str, request: Request):
@@ -238,12 +236,10 @@ async def activate_account(email: str, request: Request):
 
 @router.post("/accounts/{email}/verify", dependencies=[Depends(verify_admin)])
 async def verify_account(email: str, request: Request):
-    """单独验证某个账号的有效性 (完全复原单文件逻辑)"""
+    """单独到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
     from backend.services.qwen_client import QwenClient
     from backend.core.account_pool import AccountPool
-    import logging
 
-    log = logging.getLogger("qwen2api.admin")
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
@@ -251,15 +247,7 @@ async def verify_account(email: str, request: Request):
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    is_valid = await client.verify_token(acc.token)
-    if not is_valid and acc.password:
-        log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
-        is_valid = await client.auth_resolver.refresh_token(acc)
-
-    acc.valid = is_valid
-    await pool.save() # 直接保存，不调用 mark_invalid 以免熔断影响正常测试
-
-    return {"email": acc.email, "valid": is_valid}
+    return await client.verify_account(acc)
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):

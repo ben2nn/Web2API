@@ -12,31 +12,79 @@ from backend.core.config import settings
 from backend.core.request_logging import update_request_context
 from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
+from backend.services.workspace_context import build_workspace_final_reminder
+from backend.toolcall.formats_qnml import render_qnml_tool_calls
 from backend.toolcall.normalize import normalize_tool_name
 from backend.toolcall.stream_state import StreamingToolCallState
 
 
-# Qwen 偶尔生成的毒性"工具不存在"或"无法继续"幻觉。
-# 在流式收到前 20 字时识别，触发早期拦截 + retry 而不是流给客户端。
+# Qwen 鍋跺皵鐢熸垚鐨勬瘨鎬?宸ュ叿涓嶅瓨鍦?鎴?鏃犳硶缁х画"骞昏銆?
+# 鍦ㄦ祦寮忔敹鍒板墠 20 瀛楁椂璇嗗埆锛岃Е鍙戞棭鏈熸嫤鎴?+ retry 鑰屼笉鏄祦缁欏鎴风銆?
 _TOXIC_REFUSAL_RE = re.compile(
-    # 英文：工具不存在/不可用
     r"Tool\s+\S+\s+(?:does\s+not\s+exists?|is\s+not\s+(?:available|registered))"
     r"|I\s+cannot\s+execute\s+this\s+tool"
-    # 英文：任务放弃/拒绝继续
-    r"|I[''\u2019]?\s*m\s+sorry[,. ]"
+    r"|I['\u2019]?\s*m\s+sorry[,. ]"
     r"|I\s+cannot\s+(?:help|assist|proceed|continue|support|perform)"
-    r"|I[''\u2019]?m\s+not\s+(?:able|designed)\s+to"
+    r"|I['\u2019]?m\s+not\s+(?:able|designed)\s+to"
     r"|unable\s+to\s+(?:proceed|continue|perform|complete)"
-    # 中文：工具/操作不存在或无法继续
-    r"|该工具.{0,8}?不存在|工具.{0,12}?不存在"
-    r"|我(?:无法|不能|不可以)(?:继续|进行|支持|完成|操作|执行)"
-    r"|无法(?:进行|支持|完成|执行).{0,10}?操作"
-    r"|抱歉.{0,20}?(?:无法|不能|不支持)",
+    r"|(?:\u8be5)?\u5de5\u5177.{0,12}?\u4e0d\u5b58\u5728"
+    r"|\u65e0\u6cd5(?:\u7ee7\u7eed|\u8fdb\u884c|\u652f\u6301|\u5b8c\u6210|\u6267\u884c)"
+    r"|\u4e0d\u80fd(?:\u7ee7\u7eed|\u8fdb\u884c|\u652f\u6301|\u5b8c\u6210|\u6267\u884c)"
+    r"|\u62b1\u6b49.{0,20}?(?:\u65e0\u6cd5|\u4e0d\u80fd|\u4e0d\u652f\u6301)",
     re.IGNORECASE,
 )
 
 
 log = logging.getLogger("qwen2api.runtime")
+
+QNML_TOOL_MARKERS = (
+    "<|qnml|tool_calls",
+    "</|qnml|tool_calls",
+    "<|qnml|invoke",
+    "</|qnml|invoke",
+    "<|qnml|parameter",
+    "</|qnml|parameter",
+)
+LEGACY_XML_TOOL_MARKERS = (
+    "<tool_calls",
+    "</tool_calls",
+    "<invoke",
+    "</invoke",
+    "<parameter",
+    "</parameter",
+    "<tool_call",
+    "</tool_call",
+)
+LEGACY_HASH_TOOL_MARKERS = ("##tool_call##", "##end_call##")
+TEXTUAL_TOOL_MARKERS = QNML_TOOL_MARKERS + LEGACY_XML_TOOL_MARKERS + LEGACY_HASH_TOOL_MARKERS
+_CONTROL_TOOL_NAMES = {
+    "Agent",
+    "AskUserQuestion",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Monitor",
+    "PushNotification",
+    "ScheduleWakeup",
+    "TaskCreate",
+    "TaskDelete",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+}
+
+
+def has_textual_tool_marker(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in TEXTUAL_TOOL_MARKERS)
 
 
 @dataclass(slots=True)
@@ -210,8 +258,42 @@ def _recent_message_texts(messages: list[dict[str, Any]] | None, *, limit: int =
     return texts
 
 
-def has_recent_unchanged_read_result(messages: list[dict[str, Any]] | None) -> bool:
-    return any("Unchanged since last read" in text for text in _recent_message_texts(messages))
+def has_recent_unchanged_read_result(messages: list[dict[str, Any]] | None, read_path: str | None = None) -> bool:
+    if not messages:
+        return False
+    target = (read_path or "").strip()
+    read_by_id: dict[str, str] = {}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        parts = content if isinstance(content, list) else []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_use" and part.get("name") == "Read":
+                tool_id = str(part.get("id", ""))
+                tool_input = part.get("input", {})
+                if isinstance(tool_input, dict) and tool_id:
+                    path = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
+                    if path:
+                        read_by_id[tool_id] = path
+            elif part.get("type") == "tool_result":
+                inner = part.get("content", "")
+                if isinstance(inner, list):
+                    text = "\n".join(str(p.get("text", "")) for p in inner if isinstance(p, dict))
+                else:
+                    text = str(inner or "")
+                if "Unchanged since last read" not in text:
+                    continue
+                tool_use_id = str(part.get("tool_use_id", ""))
+                previous_path = read_by_id.get(tool_use_id, "")
+                if target:
+                    if previous_path and previous_path == target:
+                        return True
+                    continue
+                return True
+    return False
 
 
 def has_recent_search_no_results(messages: list[dict[str, Any]] | None) -> bool:
@@ -233,6 +315,58 @@ def tool_identity(tool_name: str, tool_input: Any = None) -> str:
         return f"{tool_name}::{json.dumps(tool_input or {}, ensure_ascii=False, sort_keys=True)}"
     except Exception:
         return tool_name or ""
+
+
+def _tool_input_path(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    value = tool_input.get("file_path") or tool_input.get("path") or ""
+    return str(value).strip() if value is not None else ""
+
+
+def _add_unique(values: list[str], value: str) -> None:
+    if value and value not in values:
+        values.append(value)
+
+
+def _blocked_tools_notice(request: StandardRequest) -> str:
+    blocked = [name for name in getattr(request, "retry_blocked_tools", []) if name]
+    if not blocked:
+        return ""
+    return (
+        "[RETRY TOOL BLOCKLIST - MUST OBEY]\n"
+        f"Do NOT call these tools in the next output: {', '.join(blocked)}.\n"
+        "Choose a non-control project tool such as Read/Grep/Glob/Write/Edit/Bash only when it directly advances the current task.\n"
+        "[/RETRY TOOL BLOCKLIST]"
+    )
+
+
+def _read_blocklist_notice(request: StandardRequest) -> str:
+    paths = [path for path in getattr(request, "retry_read_blocklist", []) if path]
+    if not paths:
+        return ""
+    return (
+        "[READ BLOCKLIST - MUST OBEY]\n"
+        "These files were already read or returned 'Unchanged since last read'. Do NOT call Read for them again:\n"
+        + "\n".join(f"- {path}" for path in paths[-8:])
+        + "\nUse the existing tool result, read a different relevant file, write/edit the requested output, or finish.\n"
+        "[/READ BLOCKLIST]"
+    )
+
+
+def _retry_guard_notice(request: StandardRequest) -> str:
+    notices = [
+        _blocked_tools_notice(request),
+        _read_blocklist_notice(request),
+        build_workspace_final_reminder(getattr(request, "workspace_root", None)),
+    ]
+    return "\n\n".join(notice for notice in notices if notice)
+
+
+def _inject_retry_guard(prompt: str, request: StandardRequest, message: str) -> str:
+    guard = _retry_guard_notice(request)
+    combined = "\n\n".join(part for part in (guard, message) if part)
+    return inject_assistant_message(prompt, combined)
 
 
 def recent_same_tool_identity_count(messages: list[dict[str, Any]] | None, tool_name: str, tool_input: Any = None) -> int:
@@ -282,9 +416,16 @@ def has_recent_openai_same_tool_call(history_messages: list[dict[str, Any]] | No
 
 
 def has_invalid_textual_tool_contract(answer_text: str) -> bool:
+    """Detect malformed legacy textual tool contracts that should be retried.
+
+    QNML/legacy ``<tool_calls><invoke ...>`` parse failures are handled by the
+    normal parser path below. This function only preserves the older JSON-marker
+    guard where malformed JSON or stringified ``input`` was a common failure mode.
+    """
     if not answer_text:
         return False
-    if "##TOOL_CALL##" not in answer_text and "<tool_call>" not in answer_text:
+    lowered = answer_text.lower()
+    if "##tool_call##" not in lowered and "<tool_call" not in lowered:
         return False
     compact = answer_text.strip()
     tc_m = re.search(r'##TOOL_CALL##\s*(.*?)\s*##END_CALL##', compact, re.DOTALL | re.IGNORECASE)
@@ -295,7 +436,7 @@ def has_invalid_textual_tool_contract(answer_text: str) -> bool:
             return True
         tool_input = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
         return isinstance(tool_input, str)
-    xml_m = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', compact, re.DOTALL | re.IGNORECASE)
+    xml_m = re.search(r'<tool_call\b[^>]*>\s*(.*?)\s*</tool_call>', compact, re.DOTALL | re.IGNORECASE)
     if xml_m:
         try:
             obj = json.loads(xml_m.group(1))
@@ -306,21 +447,246 @@ def has_invalid_textual_tool_contract(answer_text: str) -> bool:
     return False
 
 
-def should_retry_textual_tool_contract(answer_text: str) -> bool:
-    if not answer_text:
+def _attempted_tool_for_repair(answer_text: str, request: StandardRequest) -> str:
+    return (
+        tool_parser.extract_attempted_tool_name(answer_text, request.tool_names)
+        or (request.tool_names[0] if request.tool_names else "tool")
+    )
+
+
+def _latest_user_text(history_messages: list[dict[str, Any]] | None) -> str:
+    if not history_messages:
+        return ""
+    for message in reversed(history_messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("type") in ("text", "input_text")
+            )
+        else:
+            text = str(content or "")
+        if text.strip():
+            return text
+    return ""
+
+
+
+def _user_negated_control_tool(tool_name: str, latest: str) -> bool:
+    if not latest:
         return False
-    if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
+    latest_l = latest.lower()
+    name = re.escape(tool_name.lower())
+    compact_tool = re.sub(r"[^a-z0-9]+", "", tool_name.lower())
+
+    english_patterns = [
+        rf"(?:do\s+not|don['\u2019]?t|dont|never|without|no)\s+(?:(?:use|call|create|start|run|invoke|trigger)\s+)?{name}\b",
+        rf"\b{name}\b\s+(?:is\s+)?(?:forbidden|not\s+allowed|disabled|disallowed)",
+    ]
+    if compact_tool and compact_tool != tool_name.lower():
+        english_patterns.extend([
+            rf"(?:do\s+not|don['\u2019]?t|dont|never|without|no)\s+(?:(?:use|call|create|start|run|invoke|trigger)\s+)?{re.escape(compact_tool)}\b",
+            rf"\b{re.escape(compact_tool)}\b\s+(?:is\s+)?(?:forbidden|not\s+allowed|disabled|disallowed)",
+        ])
+    if any(re.search(pattern, latest_l, re.IGNORECASE) for pattern in english_patterns):
         return True
+
+    # Keep Chinese terms as Unicode escapes so the source survives non-UTF8 rewrites.
+    chinese_negatives = (
+        "\u4e0d\u8981",      # 不要
+        "\u522b",            # 别
+        "\u7981\u6b62",      # 禁止
+        "\u4e0d\u5f97",      # 不得
+        "\u4e0d\u51c6",      # 不准
+        "\u4e0d\u7528",      # 不用
+        "\u4e0d\u4f7f\u7528",  # 不使用
+        "\u65e0\u9700",      # 无需
+        "\u522b\u7528",      # 别用
+        "\u4e0d\u8981\u7528",  # 不要用
+        "\u4e0d\u8981\u4f7f\u7528",  # 不要使用
+        "\u4e0d\u8981\u8c03\u7528",  # 不要调用
+        "\u4e0d\u8981\u521b\u5efa",  # 不要创建
+        "\u4e0d\u8981\u6267\u884c",  # 不要执行
+        "\u4e0d\u8981\u89e6\u53d1",  # 不要触发
+    )
+    chinese_suffixes = (
+        "\u7981\u7528",      # 禁用
+        "\u7981\u6b62",      # 禁止
+        "\u4e0d\u5141\u8bb8",  # 不允许
+        "\u4e0d\u8981\u7528",  # 不要用
+        "\u4e0d\u8981\u8c03\u7528",  # 不要调用
+    )
+    negative_prefix = "|".join(re.escape(term) for term in chinese_negatives)
+    negative_suffix = "|".join(re.escape(term) for term in chinese_suffixes)
+    target_names = [name]
+    if compact_tool and compact_tool != tool_name.lower():
+        target_names.append(re.escape(compact_tool))
+    for target in target_names:
+        if re.search(rf"(?:{negative_prefix}).{{0,32}}{target}\b", latest_l, re.IGNORECASE):
+            return True
+        if re.search(rf"\b{target}\b.{{0,24}}(?:{negative_suffix})", latest_l, re.IGNORECASE):
+            return True
     return False
 
 
+def _user_requested_control_tool(tool_name: str, history_messages: list[dict[str, Any]] | None) -> bool:
+    latest = _latest_user_text(history_messages).lower()
+    if not latest:
+        return False
+    if _user_negated_control_tool(tool_name, latest):
+        return False
+    compact_tool = re.sub(r"[^a-z0-9]+", "", tool_name.lower())
+    compact_latest = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", latest)
+    if compact_tool and compact_tool in compact_latest:
+        return True
+    control_keywords = {
+        "Agent": ("agent", "subtask", "delegate", "delegation", "background agent", "\u4ee3\u7406", "\u5b50\u4efb\u52a1"),
+        "AskUserQuestion": ("askuserquestion", "ask user", "ask me", "question tool", "\u8be2\u95ee", "\u63d0\u95ee"),
+        "CronCreate": ("cron", "schedule", "scheduled task", "automation", "\u5b9a\u65f6", "\u8ba1\u5212\u4efb\u52a1"),
+        "CronDelete": ("cron", "schedule", "scheduled task", "automation", "\u5b9a\u65f6", "\u8ba1\u5212\u4efb\u52a1"),
+        "CronList": ("cron", "schedule", "scheduled task", "automation", "\u5b9a\u65f6", "\u8ba1\u5212\u4efb\u52a1"),
+        "TaskCreate": ("taskcreate", "task create", "todo tool", "task management", "\u4efb\u52a1\u7ba1\u7406", "\u5f85\u529e"),
+        "TaskUpdate": ("taskupdate", "task update", "todo tool", "task management", "\u4efb\u52a1\u7ba1\u7406", "\u5f85\u529e"),
+        "TaskList": ("tasklist", "task list tool", "todo tool", "task management", "\u4efb\u52a1\u7ba1\u7406", "\u5f85\u529e"),
+        "TaskGet": ("taskget", "task get", "todo tool", "task management", "\u4efb\u52a1\u7ba1\u7406", "\u5f85\u529e"),
+        "TaskOutput": ("taskoutput", "task output", "agent output", "subtask output", "\u5b50\u4efb\u52a1\u8f93\u51fa"),
+        "TaskStop": ("taskstop", "task stop", "stop task", "task management", "\u4efb\u52a1\u7ba1\u7406"),
+    }
+    return any(keyword in latest for keyword in control_keywords.get(tool_name, ()))
+
+
+def should_retry_textual_tool_contract(answer_text: str) -> bool:
+    return has_textual_tool_marker(answer_text)
+
+
+def _fresh_textual_tool_retry_instruction(tool_name: str) -> str:
+    canonical = normalize_tool_name(tool_name or "tool", {"Write", "Read", "Bash", "PowerShell", tool_name or "tool"})
+    base = (
+        "[MANDATORY]: Do not continue, quote, or repair partial QNML/tool markup from the previous response. "
+        "Start over with one fresh, complete tool call only, or continue with the next direct verification step if no more tool input is needed."
+    )
+    if canonical == "Write":
+        return base + " For Write, include both a non-empty file_path and the full content in the same tool call."
+    if canonical == "Read":
+        return base + " For Read, include one non-empty file_path and do not reread a file that already returned unchanged."
+    if canonical in {"Bash", "PowerShell"}:
+        return base + " For shell tools, include a complete command and keep it scoped to the active workspace."
+    return base
+
 def native_tool_calls_to_markup(tool_calls: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
+    """Render native upstream tool calls back into the prompt-visible QNML form."""
+    return render_qnml_tool_calls([
+        {"name": tool_call.get("name", ""), "input": tool_call.get("input", {})}
+        for tool_call in tool_calls
+        if isinstance(tool_call, dict)
+    ])
+
+
+
+def _is_retry_blocked_tool(tool_name: str, request: StandardRequest) -> bool:
+    blocked = {name for name in getattr(request, "retry_blocked_tools", []) if name}
+    return tool_name in blocked
+
+
+def _is_disallowed_control_tool(
+    tool_name: str,
+    request: StandardRequest,
+    history_messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    if not tool_name:
+        return False
+    if _is_retry_blocked_tool(tool_name, request):
+        return True
+    if tool_name not in _CONTROL_TOOL_NAMES:
+        return False
+    if history_messages is None:
+        return False
+    return not _user_requested_control_tool(tool_name, history_messages)
+
+
+def _is_blocked_read_call(tool_name: str, tool_input: Any, request: StandardRequest) -> bool:
+    if tool_name != "Read":
+        return False
+    read_path = _tool_input_path(tool_input)
+    if not read_path:
+        return False
+    return read_path in {path for path in getattr(request, "retry_read_blocklist", []) if path}
+
+
+def _tool_call_block_reason(
+    tool_call: dict[str, Any],
+    request: StandardRequest,
+    history_messages: list[dict[str, Any]] | None = None,
+) -> str | None:
+    raw_name = str(tool_call.get("name", ""))
+    tool_name = normalize_tool_name(raw_name, request.tool_names)
+    tool_input = tool_call.get("input", {})
+    if _is_disallowed_control_tool(tool_name, request, history_messages):
+        return f"disallowed_control_tool:{tool_name}"
+    if _is_blocked_read_call(tool_name, tool_input, request):
+        return f"blocked_read:{_tool_input_path(tool_input)}"
+    return None
+
+def _filter_invalid_native_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    request: StandardRequest,
+    history_messages: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not tool_calls:
+        return [], []
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
     for tool_call in tool_calls:
-        parts.append(
-            f'<tool_call>{{"name": {json.dumps(tool_call["name"])}, "input": {json.dumps(tool_call.get("input", {}), ensure_ascii=False)}}}</tool_call>'
+        if not isinstance(tool_call, dict):
+            invalid.append(tool_call)
+            continue
+        blocks, stop_reason = tool_parser.parse_tool_calls_silent(
+            native_tool_calls_to_markup([tool_call]),
+            request.tools,
         )
-    return "\n".join(parts)
+        parsed = next((block for block in blocks if isinstance(block, dict) and block.get("type") == "tool_use"), None)
+        if stop_reason == "tool_use" and parsed:
+            fixed = dict(tool_call)
+            fixed["name"] = parsed.get("name", fixed.get("name"))
+            fixed["input"] = parsed.get("input", fixed.get("input", {}))
+            reason = _tool_call_block_reason(fixed, request, history_messages)
+            if reason:
+                log.warning("[ToolGuard] rejected collected tool call reason=%s name=%s", reason, fixed.get("name", "-"))
+                invalid.append(fixed)
+                continue
+            valid.append(fixed)
+        else:
+            invalid.append(tool_call)
+    return valid, invalid
+
+
+def _tool_input_preview(input_data: Any, *, limit: int = 260) -> str:
+    try:
+        raw = json.dumps(input_data if input_data is not None else {}, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        raw = repr(input_data)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:limit] + ("...[truncated]" if len(raw) > limit else "")
+
+
+def _log_tool_calls(stage: str, tool_calls: list[dict[str, Any]]) -> None:
+    for idx, tool_call in enumerate(tool_calls, start=1):
+        if not isinstance(tool_call, dict):
+            log.info("[ToolCall] stage=%s index=%s invalid_block=%r", stage, idx, tool_call)
+            continue
+        log.info(
+            "[ToolCall] stage=%s index=%s id=%s name=%s input=%s",
+            stage,
+            idx,
+            tool_call.get("id", "-"),
+            tool_call.get("name", "-"),
+            _tool_input_preview(tool_call.get("input", {})),
+        )
 
 
 async def run_runtime_attempt(
@@ -342,6 +708,7 @@ async def run_runtime_attempt(
         current_prompt,
         capture_events=capture_events,
         on_delta=on_delta,
+        history_messages=history_messages,
     )
     retry = evaluate_retry_directive(
         request=request,
@@ -369,23 +736,25 @@ async def collect_completion_run(
     *,
     capture_events: bool = True,
     on_delta: Callable[[dict[str, Any], str | None, list[dict[str, Any]] | None], Awaitable[None]] | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
 ) -> RuntimeExecutionResult:
     chat_id = None
     acc = None
     answer_fragments: list[str] = []
     reasoning_fragments: list[str] = []
     native_tool_calls: list[dict[str, Any]] = []
+    rejected_tool_calls: list[dict[str, Any]] = []
     tool_state = StreamingToolCallState()
     emitted_visible_output = False
     first_event_marked = False
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
 
-    # 初始化 Tool Sieve 用于实时检测
+    # 鍒濆鍖?Tool Sieve 鐢ㄤ簬瀹炴椂妫€娴?
     tool_sieve = None
     if request.tools:
         tool_sieve = tool_parser.ToolSieve(request.tool_names)
-        log.info("[收集完成] 工具过滤器已启用，工具列表: %s", request.tool_names)
+        log.info("[Collect] tool filter enabled: tools=%s", request.tool_names)
 
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         answer_text = "".join(answer_fragments)
@@ -393,18 +762,18 @@ async def collect_completion_run(
         if native_tool_calls and not answer_text:
             answer_text = native_tool_calls_to_markup(native_tool_calls)
 
-        # 关键修复：强制解析最终文本中的工具调用
-        detected_tool_calls = native_tool_calls
-        final_finish_reason = "tool_calls" if native_tool_calls else "stop"
+        # 鍏抽敭淇锛氬己鍒惰В鏋愭渶缁堟枃鏈腑鐨勫伐鍏疯皟鐢?
+        detected_tool_calls = native_tool_calls or (rejected_tool_calls if reason == "invalid_tool_args" else [])
+        final_finish_reason = "invalid_tool_args" if reason == "invalid_tool_args" else ("tool_calls" if native_tool_calls else "stop")
 
-        # 第一重：刷新 Tool Sieve
+        # 绗竴閲嶏細鍒锋柊 Tool Sieve
         if tool_sieve and not native_tool_calls:
             flush_events = tool_sieve.flush()
             for evt in flush_events:
                 if evt.get("type") == "tool_calls":
                     calls = evt.get("calls", [])
                     if calls:
-                        # 转换为标准格式
+                        # 杞崲涓烘爣鍑嗘牸寮?
                         import uuid
                         detected_tool_calls = [{
                             "type": "tool_use",
@@ -412,28 +781,65 @@ async def collect_completion_run(
                             "name": call["name"],
                             "input": call["input"]
                         } for call in calls]
+                        detected_tool_calls, invalid_calls = _filter_invalid_native_tool_calls(detected_tool_calls, request, history_messages)
+                        if invalid_calls:
+                            rejected_tool_calls.extend(invalid_calls)
+                            log.warning(
+                                "[Collect] Tool Sieve flush rejected invalid tool calls: tools=%s",
+                                [c.get("name") for c in invalid_calls if isinstance(c, dict)],
+                            )
+                            continue
                         final_finish_reason = "tool_calls"
+                        _log_tool_calls("tool_sieve_flush", detected_tool_calls)
                         log.info(
-                            "[Collect] ✓ Tool Sieve 刷新检测到工具调用: tools=%s",
+                            "[Collect] Tool Sieve flush detected tool calls: tools=%s",
                             [t.get("name") for t in detected_tool_calls],
                         )
                         break
                 elif evt.get("type") == "content":
-                    # 剩余文本内容
+                    # 鍓╀綑鏂囨湰鍐呭
                     pass
+            if rejected_tool_calls and not detected_tool_calls:
+                detected_tool_calls = rejected_tool_calls
+                final_finish_reason = "invalid_tool_args"
 
-        # 第二重：解析最终文本
+        # 绗簩閲嶏細瑙ｆ瀽鏈€缁堟枃鏈?
         if not detected_tool_calls and request.tools and answer_text:
-            # 尝试从最终文本中解析工具调用
+            # 灏濊瘯浠庢渶缁堟枃鏈腑瑙ｆ瀽宸ュ叿璋冪敤
             tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(answer_text, request.tools)
             tool_use_blocks = [b for b in tool_blocks if b.get("type") == "tool_use"]
 
             if tool_use_blocks and stop_reason == "tool_use":
-                # 找到工具调用！
+                # 鎵惧埌宸ュ叿璋冪敤锛?
                 detected_tool_calls = tool_use_blocks
+                detected_tool_calls, invalid_calls = _filter_invalid_native_tool_calls(detected_tool_calls, request, history_messages)
+                if invalid_calls:
+                    rejected_tool_calls.extend(invalid_calls)
+                    log.warning(
+                        "[Collect] final text parser rejected invalid tool calls: tools=%s",
+                        [c.get("name") for c in invalid_calls if isinstance(c, dict)],
+                    )
+                    detected_tool_calls = []
+                if not detected_tool_calls:
+                    finish_reason = "invalid_tool_args" if rejected_tool_calls else "stop"
+                    return RuntimeExecutionResult(
+                        state=RuntimeAttemptState(
+                            answer_text=answer_text,
+                            reasoning_text=reasoning_text,
+                            tool_calls=rejected_tool_calls if rejected_tool_calls else [],
+                            blocked_tool_names=[],
+                            finish_reason=finish_reason,
+                            raw_events=raw_events,
+                            emitted_visible_output=emitted_visible_output,
+                            stage_metrics=metrics.as_dict(),
+                        ),
+                        chat_id=chat_id,
+                        acc=acc,
+                    )
                 final_finish_reason = "tool_calls"
+                _log_tool_calls("final_text_parse", detected_tool_calls)
 
-                # 从文本中移除工具调用部分
+                # 浠庢枃鏈腑绉婚櫎宸ュ叿璋冪敤閮ㄥ垎
                 text_blocks = [b for b in tool_blocks if b.get("type") == "text"]
                 if text_blocks:
                     answer_text = text_blocks[0].get("text", "")
@@ -441,22 +847,32 @@ async def collect_completion_run(
                     answer_text = ""
 
                 log.info(
-                    "[Collect] ✓ 最终文本解析检测到工具调用: tools=%s, cleaned_text_len=%s",
+                    "[Collect] final text parser detected tool calls: tools=%s, cleaned_text_len=%s",
                     [t.get("name") for t in detected_tool_calls],
                     len(answer_text),
                 )
 
-        # 检查空输出
+        # 妫€鏌ョ┖杈撳嚭
+        if not detected_tool_calls and request.tools and answer_text and has_textual_tool_marker(answer_text):
+            attempted = _attempted_tool_for_repair(answer_text, request)
+            log.warning(
+                "[Collect] blocked unparsed textual tool markup before client output: attempted=%s len=%s reason=%s",
+                attempted,
+                len(answer_text),
+                reason,
+            )
+            answer_text = ""
+            final_finish_reason = "invalid_tool_args"
         if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
             log.warning(
-                "[收集完成] 上游返回空输出: 原因=%s 会话=%s",
+                "[Collect] upstream returned empty output: reason=%s chat_id=%s",
                 reason,
                 chat_id,
             )
-            # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
+            # 濡傛灉鏈?reasoning 浣嗘病鏈?visible output锛岃鏄庢ā鍨嬪彧杈撳嚭浜嗘€濊€冭繃绋?
             if reasoning_text.strip():
-                log.warning("[收集完成] 模型只返回了推理内容，没有可见输出")
-            # 空响应 flush 该账号池（同批次预热的可能都是坏的），下次走新建
+                log.warning("[Collect] upstream returned reasoning only without visible output")
+            # 绌哄搷搴?flush 璇ヨ处鍙锋睜锛堝悓鎵规棰勭儹鐨勫彲鑳介兘鏄潖鐨勶級锛屼笅娆¤蛋鏂板缓
             try:
                 pool = getattr(client, "executor", None) and getattr(client.executor, "chat_id_pool", None)
                 if pool is not None and acc is not None:
@@ -467,7 +883,7 @@ async def collect_completion_run(
 
         if reason:
             log.info(
-                "[收集完成] 原因=%s 会话=%s 工具调用=%s 答复字数=%s 推理字数=%s 结束原因=%s",
+                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s finish_reason=%s",
                 reason,
                 chat_id,
                 len(detected_tool_calls),
@@ -475,6 +891,8 @@ async def collect_completion_run(
                 len(reasoning_text),
                 final_finish_reason,
             )
+        if detected_tool_calls:
+            _log_tool_calls(f"final:{reason or 'stream_end'}", detected_tool_calls)
         metrics.mark("stream_finish", float(len(raw_events)))
         state = RuntimeAttemptState(
             answer_text=answer_text,
@@ -527,35 +945,46 @@ async def collect_completion_run(
         if phase == "answer" and content:
             answer_fragments.append(content)
 
-            # 毒性拒绝早期拦截：Qwen 偶尔幻觉出 "Tool X does not exists." 之类文本。
-            # 在标记 emitted_visible_output 之前识别并提前 finalize，让 evaluate_retry_directive
-            # 的 blocked_tool_name 分支能正常触发重试（否则 emitted=True 后就不 retry 了）。
+            # 姣掓€ф嫆缁濇棭鏈熸嫤鎴細Qwen 鍋跺皵骞昏鍑?"Tool X does not exists." 涔嬬被鏂囨湰銆?
+            # 鍦ㄦ爣璁?emitted_visible_output 涔嬪墠璇嗗埆骞舵彁鍓?finalize锛岃 evaluate_retry_directive
+            # 鐨?blocked_tool_name 鍒嗘敮鑳芥甯歌Е鍙戦噸璇曪紙鍚﹀垯 emitted=True 鍚庡氨涓?retry 浜嗭級銆?
             if (
                 request.tools
                 and not emitted_visible_output
                 and len("".join(answer_fragments)) >= 20
             ):
                 early_answer = "".join(answer_fragments).strip()
-                if _TOXIC_REFUSAL_RE.search(early_answer):
+                # Valid textual tool calls start as answer text before ToolSieve
+                # finishes parsing them. Do not classify those markers as a
+                # refusal/toxic answer; let the tool parser consume or block them.
+                if not has_textual_tool_marker(early_answer) and _TOXIC_REFUSAL_RE.search(early_answer):
                     toxic_blocked = extract_blocked_tool_names(early_answer, request.tool_names)
                     blocked_name = toxic_blocked[0] if toxic_blocked else "unknown"
                     log.warning(
-                        "[收集完成] 污染拦截 %r (未流出客户端，触发重试)",
+                        "[Collect] blocked contaminated output before client stream: preview=%r",
                         early_answer[:80],
                     )
                     return _finalize_result(reason=f"blocked_tool_name:{blocked_name}")
 
-            emitted_visible_output = True
             if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
 
-            # Tool Sieve 实时检测
+            # Tool Sieve mirrors ds2api's stream path: only release safe text,
+            # buffer possible tool markup, and emit tool calls as soon as a complete
+            # QNML/legacy block is parsed instead of waiting for upstream EOF.
             if tool_sieve:
                 sieve_events = tool_sieve.process_chunk(content)
                 for sieve_evt in sieve_events:
+                    if sieve_evt.get("type") == "content":
+                        safe_text = sieve_evt.get("text", "")
+                        if safe_text:
+                            emitted_visible_output = True
+                            if on_delta is not None:
+                                await on_delta(evt, safe_text, None)
+                        continue
+
                     if sieve_evt.get("type") == "tool_calls":
-                        # 检测到工具调用！
                         calls = sieve_evt.get("calls", [])
                         if calls:
                             import uuid
@@ -565,13 +994,41 @@ async def collect_completion_run(
                                 "name": call["name"],
                                 "input": call["input"]
                             } for call in calls]
+                            detected_calls, invalid_calls = _filter_invalid_native_tool_calls(detected_calls, request, history_messages)
+                            if invalid_calls:
+                                rejected_tool_calls.extend(invalid_calls)
+                                log.warning(
+                                    "[Collect] Tool Sieve rejected invalid tool calls: tools=%s",
+                                    [c.get("name") for c in invalid_calls if isinstance(c, dict)],
+                                )
+                                return _finalize_result(reason="invalid_tool_args")
                             native_tool_calls.extend(detected_calls)
+                            emitted_visible_output = True
+                            _log_tool_calls("tool_sieve_stream", detected_calls)
                             log.info(
-                                "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
+                                "[Collect] Tool Sieve detected tool calls in stream: tools=%s",
                                 [c.get("name") for c in detected_calls],
                             )
+                            if on_delta is not None:
+                                await on_delta({**evt, "phase": "tool_call"}, None, detected_calls)
                             return _finalize_result(reason="tool_sieve_detected")
 
+                if request.tools:
+                    answer_text = "".join(answer_fragments)
+                    if len(answer_fragments) % 3 == 0 or "does not exist" in content.lower():
+                        blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
+                        if blocked_tool_names:
+                            return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+                    if has_textual_tool_marker(answer_text):
+                        directive = parse_tool_directive_once(
+                            request,
+                            RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
+                        )
+                        if directive.stop_reason == "tool_use":
+                            return _finalize_result(reason="textual_tool_use")
+                continue
+
+            emitted_visible_output = True
             if on_delta is not None:
                 await on_delta(evt, content, None)
             if request.tools:
@@ -580,7 +1037,7 @@ async def collect_completion_run(
                     blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
                     if blocked_tool_names:
                         return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
-                if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
+                if has_textual_tool_marker(answer_text):
                     directive = parse_tool_directive_once(
                         request,
                         RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
@@ -596,7 +1053,16 @@ async def collect_completion_run(
                 first_event_marked = True
             completed_calls = tool_state.process_event(evt)
             if completed_calls:
+                completed_calls, invalid_calls = _filter_invalid_native_tool_calls(completed_calls, request, history_messages)
+                if invalid_calls:
+                    rejected_tool_calls.extend(invalid_calls)
+                    log.warning(
+                        "[Collect] native tool_call rejected invalid tool calls: tools=%s",
+                        [c.get("name") for c in invalid_calls if isinstance(c, dict)],
+                    )
+                    return _finalize_result(reason="invalid_tool_args")
                 native_tool_calls.extend(completed_calls)
+                _log_tool_calls("native_stream", completed_calls)
                 if on_delta is not None:
                     await on_delta(evt, None, completed_calls)
                 return _finalize_result(reason="native_tool_use")
@@ -621,12 +1087,21 @@ def parse_tool_directive_once(request: StandardRequest, state: RuntimeAttemptSta
 
     if request.tools and state.answer_text:
         tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(state.answer_text, request.tools)
+        if stop_reason != "tool_use" and has_textual_tool_marker(state.answer_text):
+            attempted = _attempted_tool_for_repair(state.answer_text, request)
+            return RuntimeToolDirective(
+                tool_blocks=[{
+                    "type": "text",
+                    "text": f"Invalid tool-call format was blocked for {attempted}. Retry the current request with a valid tool call.",
+                }],
+                stop_reason="end_turn",
+            )
         return RuntimeToolDirective(tool_blocks=tool_blocks, stop_reason=stop_reason)
 
     return RuntimeToolDirective(tool_blocks=[{"type": "text", "text": state.answer_text}], stop_reason="end_turn")
 
 
-# ==================== 截断续写 + 流式 warmup（P2-6 & P2-10 接入）====================
+# ==================== 鎴柇缁啓 + 娴佸紡 warmup锛圥2-6 & P2-10 鎺ュ叆锛?===================
 
 async def collect_completion_run_with_recovery(
     client,
@@ -635,21 +1110,22 @@ async def collect_completion_run_with_recovery(
     *,
     capture_events: bool = True,
     on_delta: Callable[[dict[str, Any], str | None, list[dict[str, Any]] | None], Awaitable[None]] | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
     max_continuation: int = 2,
     warmup_chars: int = 0,
     guard_chars: int = 0,
 ) -> RuntimeExecutionResult:
-    """collect_completion_run 的增强版，叠加两个能力：
+    """collect_completion_run 鐨勫寮虹増锛屽彔鍔犱袱涓兘鍔涳細
 
-    1. **截断自动续写**（P2-6）：初始流结束若 answer_text 含未闭合的 ##TOOL_CALL## 块，
-       最多追加 max_continuation 次续写请求，每次丢弃工具定义省上下文预算，
-       用 deduplicate_continuation 去除头尾重叠后拼接。
+    1. **Truncation recovery** (P2-6): if answer_text ends inside an unclosed QNML tool block,
+       鏈€澶氳拷鍔?max_continuation 娆＄画鍐欒姹傦紝姣忔涓㈠純宸ュ叿瀹氫箟鐪佷笂涓嬫枃棰勭畻锛?
+       鐢?deduplicate_continuation 鍘婚櫎澶村熬閲嶅彔鍚庢嫾鎺ャ€?
 
-    2. **流式 warmup/guard**（P2-10）：当 warmup_chars>0 时，用 IncrementalTextStreamer
-       包装 on_delta 的 text 路径——起步累积 warmup_chars 字符后才放行，
-       任何时刻保留末尾 guard_chars 字符暂不发出，给跨 chunk 清洗预留空间。
+    2. **娴佸紡 warmup/guard**锛圥2-10锛夛細褰?warmup_chars>0 鏃讹紝鐢?IncrementalTextStreamer
+       鍖呰 on_delta 鐨?text 璺緞鈥斺€旇捣姝ョ疮绉?warmup_chars 瀛楃鍚庢墠鏀捐锛?
+       浠讳綍鏃跺埢淇濈暀鏈熬 guard_chars 瀛楃鏆備笉鍙戝嚭锛岀粰璺?chunk 娓呮礂棰勭暀绌洪棿銆?
 
-    保留向后兼容：不传可选参数 → 行为与 collect_completion_run 完全一致。
+    淇濈暀鍚戝悗鍏煎锛氫笉浼犲彲閫夊弬鏁?鈫?琛屼负涓?collect_completion_run 瀹屽叏涓€鑷淬€?
     """
     from backend.services.truncation_recovery import (
         build_continuation_prompt,
@@ -667,7 +1143,7 @@ async def collect_completion_run_with_recovery(
         )
 
         async def _wrapped(evt, text_chunk, tool_calls):
-            # 仅对纯文本 delta 做 warmup；tool_calls / thinking / native 直接透传
+            # 浠呭绾枃鏈?delta 鍋?warmup锛泃ool_calls / thinking / native 鐩存帴閫忎紶
             if text_chunk is None or tool_calls is not None or evt.get("phase") not in ("answer", "text"):
                 await on_delta(evt, text_chunk, tool_calls)
                 return
@@ -681,22 +1157,23 @@ async def collect_completion_run_with_recovery(
         client, request, prompt,
         capture_events=capture_events,
         on_delta=wrapped_on_delta,
+        history_messages=history_messages,
     )
 
-    # 若 warmup 还保留着尾部，flush 出去
+    # 鑻?warmup 杩樹繚鐣欑潃灏鹃儴锛宖lush 鍑哄幓
     if streamer is not None and on_delta is not None:
         tail = streamer.finish()
         if tail:
             await on_delta({"phase": "answer"}, tail, None)
 
-    # 截断续写
+    # 鎴柇缁啓
     continues = 0
     while continues < max_continuation:
         state = result.state
-        # 有已检出的工具调用就不续写（让客户端去执行那个 tool）
+        # 鏈夊凡妫€鍑虹殑宸ュ叿璋冪敤灏变笉缁啓锛堣瀹㈡埛绔幓鎵ц閭ｄ釜 tool锛?
         if state.tool_calls:
             break
-        # 没 tools 的场景不做续写（纯聊天，截断检测无 ##TOOL_CALL## 参考点会误触发）
+        # No tools: skip recovery; without QNML/legacy marker context plain text can false-positive.
         if not request.tools:
             break
         if not is_truncated(state.answer_text):
@@ -709,7 +1186,7 @@ async def collect_completion_run_with_recovery(
         )
 
         assistant_ctx, followup = build_continuation_prompt(state.answer_text, anchor_chars=2000)
-        # 续写 prompt = 原 prompt + assistant 已输出的锚点 + user 续写指令
+        # 缁啓 prompt = 鍘?prompt + assistant 宸茶緭鍑虹殑閿氱偣 + user 缁啓鎸囦护
         cont_prompt = (
             f"{prompt.rstrip()}\n\nAssistant: {assistant_ctx}\n\nHuman: {followup}\n\nAssistant:"
         )
@@ -718,6 +1195,7 @@ async def collect_completion_run_with_recovery(
             client, request, cont_prompt,
             capture_events=False,
             on_delta=on_delta,  # 不经过 streamer，续写内容直接透传
+            history_messages=history_messages,
         )
         cont_text = cont_result.state.answer_text
         if not cont_text or not cont_text.strip():
@@ -745,21 +1223,55 @@ async def collect_completion_run_with_recovery(
             "[TruncRecover] continuation=%d produced %d new chars; total=%d",
             continues, len(deduped), len(merged_answer),
         )
-        # 若续写完成后已闭合则收工
+        # 鑻ョ画鍐欏畬鎴愬悗宸查棴鍚堝垯鏀跺伐
         if not is_truncated(merged_answer):
             break
 
     return result
 
 
+
+def _filter_tool_directive(
+    directive: RuntimeToolDirective,
+    request: StandardRequest,
+    history_messages: list[dict[str, Any]] | None = None,
+) -> RuntimeToolDirective:
+    if directive.stop_reason != "tool_use":
+        return directive
+    filtered_blocks: list[dict[str, Any]] = []
+    blocked_reasons: list[str] = []
+    for block in directive.tool_blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            filtered_blocks.append(block)
+            continue
+        reason = _tool_call_block_reason(block, request, history_messages)
+        if reason:
+            blocked_reasons.append(reason)
+            log.warning("[ToolGuard] blocked final directive reason=%s name=%s", reason, block.get("name", "-"))
+            continue
+        filtered_blocks.append(block)
+    if any(isinstance(block, dict) and block.get("type") == "tool_use" for block in filtered_blocks):
+        return RuntimeToolDirective(tool_blocks=filtered_blocks, stop_reason="tool_use")
+    if blocked_reasons:
+        return RuntimeToolDirective(
+            tool_blocks=[{
+                "type": "text",
+                "text": "Blocked an invalid or disallowed tool call before sending it to the client. Retrying is required to continue the task safely.",
+            }],
+            stop_reason="end_turn",
+        )
+    return RuntimeToolDirective(tool_blocks=filtered_blocks, stop_reason="end_turn")
+
 def build_tool_directive(
     request: StandardRequest,
     state: RuntimeAttemptState,
+    history_messages: list[dict[str, Any]] | None = None,
 ) -> RuntimeToolDirective:
-    directive = parse_tool_directive_once(request, state)
+    raw_directive = parse_tool_directive_once(request, state)
+    directive = _filter_tool_directive(raw_directive, request, history_messages)
     log.info(
-        f"[ToolDirective] tool_blocks={len(directive.tool_blocks)} stop_reason={directive.stop_reason} "
-        f"has_tool_use={any(b.get('type') == 'tool_use' for b in directive.tool_blocks)}"
+        f"[ToolDirective] tool_blocks={len(directive.tool_blocks)} raw_tool_blocks={len(raw_directive.tool_blocks)} "
+        f"stop_reason={directive.stop_reason} has_tool_use={any(b.get('type') == 'tool_use' for b in directive.tool_blocks)}"
     )
     return directive
 
@@ -813,8 +1325,8 @@ def build_usage_delta_factory(prompt: str) -> Callable[[RuntimeExecutionResult, 
 
 
 def request_max_attempts(request: StandardRequest) -> int:
-    # 工具模式下给模型更多重试机会（毒性幻觉/重复调用场景常见），
-    # 原值 2 在多轮 retry 里太容易用完，升到 4
+    # 宸ュ叿妯″紡涓嬬粰妯″瀷鏇村閲嶈瘯鏈轰細锛堟瘨鎬у够瑙?閲嶅璋冪敤鍦烘櫙甯歌锛夛紝
+    # 鍘熷€?2 鍦ㄥ杞?retry 閲屽お瀹规槗鐢ㄥ畬锛屽崌鍒?4
     return 4 if request.tools else settings.MAX_RETRIES
 
 
@@ -847,28 +1359,46 @@ def evaluate_retry_directive(
 
     def _retry(reason: str, next_prompt: str) -> RuntimeRetryDirective:
         log.info(
-            "[重试] 原因=%s 第%s/%s次 客户端=%s 屏蔽=%s 结束原因=%s 已流出=%s",
+            "[Retry] reason=%s attempt=%s/%s client=%s blocked=%s finish_reason=%s emitted=%s",
             reason,
             attempt_index + 1,
             max_attempts,
             getattr(request, "client_profile", "-"),
-            state.blocked_tool_names[:3],
+            getattr(request, "retry_blocked_tools", [])[:8],
             state.finish_reason,
             state.emitted_visible_output,
         )
         return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
 
+    if state.finish_reason == "invalid_tool_args" and request.tools and can_retry_after_output:
+        attempted_tools = [
+            normalize_tool_name(str(call.get("name", "")), request.tool_names)
+            for call in state.tool_calls
+            if isinstance(call, dict) and call.get("name")
+        ]
+        disallowed = [name for name in attempted_tools if _is_disallowed_control_tool(name, request, history_messages)]
+        for name in disallowed:
+            _add_unique(request.retry_blocked_tools, name)
+        force_text = (
+            "[MANDATORY]: The previous tool call was invalid, disallowed, or incomplete. "
+            "Do NOT reuse or continue any partial QNML/tool markup from the previous response. "
+            "Start a fresh complete tool call with all required arguments, or continue with direct project tools such as Read/Grep/Glob/Write/Edit/Bash when they advance the task. "
+            "Use control/task/scheduling/delegation tools only when they are clearly necessary for the current task context or explicitly requested."
+        )
+        reason = f"unexpected_control_tool:{disallowed[0]}" if disallowed else "invalid_tool_args"
+        return _retry(reason, _inject_retry_guard(current_prompt, request, force_text))
     if state.blocked_tool_names and request.tools:
         if not can_retry_after_output:
             return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
         blocked_name = normalize_tool_name(state.blocked_tool_names[0], request.tool_names)
+        reminder_prompt = tool_parser.inject_format_reminder(
+            current_prompt,
+            blocked_name,
+            client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+        )
         return _retry(
             f"blocked_tool_name:{blocked_name}",
-            tool_parser.inject_format_reminder(
-                current_prompt,
-                blocked_name,
-                client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
-            ),
+            _inject_retry_guard(reminder_prompt, request, ""),
         )
 
     if request.tools:
@@ -877,151 +1407,95 @@ def evaluate_retry_directive(
             saw_contract_markup = should_retry_textual_tool_contract(state.answer_text)
             if saw_contract_markup and can_retry_after_output:
                 if has_invalid_textual_tool_contract(state.answer_text):
-                    fallback_tool_name = request.tool_names[0] if request.tool_names else "tool"
+                    fallback_tool_name = _attempted_tool_for_repair(state.answer_text, request)
+                    reminder_prompt = tool_parser.inject_format_reminder(
+                        current_prompt,
+                        fallback_tool_name,
+                        client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+                    )
                     return _retry(
                         f"invalid_textual_tool_contract:{fallback_tool_name}",
-                        tool_parser.inject_format_reminder(
-                            current_prompt,
-                            fallback_tool_name,
-                            client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
-                        ),
+                        _inject_retry_guard(reminder_prompt, request, _fresh_textual_tool_retry_instruction(fallback_tool_name)),
                     )
                 directive = parse_tool_directive_once(request, state)
                 if directive.stop_reason != "tool_use":
-                    fallback_tool_name = request.tool_names[0] if request.tool_names else "tool"
+                    fallback_tool_name = _attempted_tool_for_repair(state.answer_text, request)
+                    reminder_prompt = tool_parser.inject_format_reminder(
+                        current_prompt,
+                        fallback_tool_name,
+                        client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+                    )
                     return _retry(
                         f"unparsed_textual_tool_contract:{fallback_tool_name}",
-                        tool_parser.inject_format_reminder(
-                            current_prompt,
-                            fallback_tool_name,
-                            client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
-                        ),
+                        _inject_retry_guard(reminder_prompt, request, _fresh_textual_tool_retry_instruction(fallback_tool_name)),
                     )
         if directive is None:
             directive = parse_tool_directive_once(request, state)
+
         if directive.stop_reason == "tool_use":
             first_tool = next((b for b in directive.tool_blocks if b.get("type") == "tool_use"), None)
             if first_tool:
-                repeated_same_tool = False
-                if getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE) == "openclaw_openai":
-                    repeated_same_tool = has_recent_openai_same_tool_call(
-                        history_messages,
-                        first_tool.get("name", ""),
-                        first_tool.get("input", {}),
+                tool_name = str(first_tool.get("name", ""))
+                tool_input = first_tool.get("input", {})
+                if _is_disallowed_control_tool(tool_name, request, history_messages) and can_retry_after_output:
+                    _add_unique(request.retry_blocked_tools, tool_name)
+                    force_text = (
+                        f"[MANDATORY]: Do NOT call {tool_name} again in this retry. That control/task/scheduling/delegation call was not clearly necessary for the current task context or was previously blocked. "
+                        "Continue with direct project tools such as Read/Grep/Glob/Write/Edit/Bash unless a control tool is clearly required."
                     )
+                    return _retry(
+                        f"unexpected_control_tool:{tool_name}",
+                        _inject_retry_guard(current_prompt, request, force_text),
+                    )
+
+                if getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE) == "openclaw_openai":
+                    repeated_same_tool = has_recent_openai_same_tool_call(history_messages, tool_name, tool_input)
                 else:
-                    repeated_same_tool = recent_same_tool_identity_count(
-                        history_messages,
-                        first_tool.get("name", ""),
-                        first_tool.get("input", {}),
-                    ) >= 1
+                    repeated_same_tool = recent_same_tool_identity_count(history_messages, tool_name, tool_input) >= 1
                 if repeated_same_tool and can_retry_after_output:
                     force_text = (
-                        f"[强制要求]: 你已经用相同参数调用了 {first_tool.get('name')}。"
-                        "不要重复相同的工具调用。"
-                        "使用已有的工具结果，选择下一个相关工具或完成任务。"
-                        "如果是配置文件任务，读取一次后直接编辑/写入文件，不要重复读取。"
-                        f"\n[MANDATORY]: You already called {first_tool.get('name')} with the same input. "
-                        "Do NOT repeat the same tool call. "
-                        "Use the tool result you already have and either choose the next relevant tool or finish the task. "
-                        "If this is a config-file task, read once and then edit/write the file instead of rereading it."
+                        f"[MANDATORY]: You already called {tool_name} with the same input. "
+                        "Do NOT repeat the same tool call. Use the previous tool result, choose the next relevant tool, write/edit the requested output, or finish."
                     )
                     return _retry(
-                        f"repeated_same_tool:{first_tool.get('name', '')}",
-                        inject_assistant_message(current_prompt, force_text),
+                        f"repeated_same_tool:{tool_name}",
+                        _inject_retry_guard(current_prompt, request, force_text),
                     )
-            if (
-                first_tool
-                and first_tool.get("name") == "Read"
-                and has_recent_unchanged_read_result(history_messages)
-            ):
-                if can_retry_after_output:
+
+                if tool_name == "Read" and has_recent_unchanged_read_result(history_messages, _tool_input_path(tool_input)):
+                    read_path = _tool_input_path(tool_input)
+                    _add_unique(request.retry_read_blocklist, read_path)
+                    if can_retry_after_output:
+                        force_text = (
+                            "[MANDATORY]: You just received 'Unchanged since last read'. "
+                            f"Do NOT call Read again for this target{(': ' + read_path) if read_path else ''}. "
+                            "Use the existing result, choose another tool, write/edit the requested output, or finish."
+                        )
+                        return _retry(
+                            "unchanged_read_result",
+                            _inject_retry_guard(current_prompt, request, force_text),
+                        )
+                    log.warning("[Runtime] blocked repeated Read after unchanged result, but cannot retry")
+
+                if tool_name == "WebSearch" and has_recent_search_no_results(history_messages) and can_retry_after_output:
                     force_text = (
-                        "[强制要求]: 你刚收到'Unchanged since last read'（文件未改变）。"
-                        "不要再次读取同一个文件。"
-                        "现在选择其他工具或完成任务。"
-                        "\n[MANDATORY]: You just received 'Unchanged since last read'. "
-                        "Do NOT call Read again. Choose another tool or finish the task."
+                        "[MANDATORY]: The last WebSearch returned no results. "
+                        "Do NOT call WebSearch again with similar wording. Use another tool or finish with the best available answer."
                     )
                     return _retry(
-                        "unchanged_read_result",
-                        inject_assistant_message(current_prompt, force_text),
-                    )
-                else:
-                    log.warning(f"[Runtime] Blocked repeated Read after 'Unchanged since last read', but cannot retry")
-
-            # 防止自动调用Agent工具
-            if (
-                first_tool
-                and first_tool.get("name") == "Agent"
-                and can_retry_after_output
-            ):
-                # 检查用户消息中是否明确提到agent相关词汇
-                user_mentioned_agent = False
-                for msg in reversed(history_messages or []):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            text = content.lower()
-                        elif isinstance(content, list):
-                            text = " ".join(
-                                part.get("text", "").lower()
-                                for part in content
-                                if isinstance(part, dict) and part.get("type") == "text"
-                            )
-                        else:
-                            text = ""
-                        if any(keyword in text for keyword in ["agent", "代理", "子任务", "subtask", "background"]):
-                            user_mentioned_agent = True
-                        break
-
-                if not user_mentioned_agent:
-                    force_text = (
-                        "[强制要求]: 不要自动调用Agent工具。用户没有要求使用代理或子任务。"
-                        "请直接完成用户的请求，使用Read/Write/Edit等工具。"
-                        "\n[MANDATORY]: Do NOT call Agent tool automatically. User did not request agent or subtask. "
-                        "Complete the user's request directly using Read/Write/Edit tools."
-                    )
-                    return _retry(
-                        "auto_agent_blocked",
-                        inject_assistant_message(current_prompt, force_text),
+                        "search_no_results",
+                        _inject_retry_guard(current_prompt, request, force_text),
                     )
 
-            if (
-                first_tool
-                and first_tool.get("name") == "WebSearch"
-                and has_recent_search_no_results(history_messages)
-                and can_retry_after_output
-            ):
-                force_text = (
-                    "[强制要求]: 上次WebSearch没有返回结果。"
-                    "不要用类似的词再次调用WebSearch。"
-                    "使用其他工具或用现有信息完成回答。"
-                    "\n[MANDATORY]: The last WebSearch returned no results. "
-                    "Do NOT call WebSearch again with similar wording. "
-                    "Use another tool or finish with the best available answer."
-                )
-                return _retry(
-                    "search_no_results",
-                    inject_assistant_message(current_prompt, force_text),
-                )
-
-    # 空响应重试：上游返回 answer_chars=0 tool_calls=0 finish_reason=stop
-    # 典型场景是 Qwen 后端对某个 chat_id 返回空（常见于池化 chat_id 刚建好就被用、
-    # 或 Qwen 服务抖动时）。换账号 + 换新 chat_id 再试一次。
     if (
         not state.answer_text
         and not state.tool_calls
         and state.finish_reason == "stop"
         and not state.emitted_visible_output
     ):
-        return _retry(
-            "empty_upstream_response",
-            current_prompt,  # prompt 不变，让上游重新处理
-        )
+        return _retry("empty_upstream_response", current_prompt)
 
     return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
-
 
 async def continue_after_retry_directive(*, client, execution, retry: RuntimeRetryDirective, preserve_chat: bool = False) -> RuntimeRetryContinuation:
     if not retry.retry:

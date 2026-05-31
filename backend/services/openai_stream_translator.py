@@ -59,6 +59,12 @@ class OpenAIStreamTranslator:
         common_markers = (
             "tool does not exists",
             "</think>",
+            "<|qnml|tool_calls",
+            "</|qnml|tool_calls",
+            "<|qnml|invoke",
+            "<tool_calls",
+            "</tool_calls",
+            "<invoke",
             "function.name:",
             "##tool_call##",
             "##end_call##",
@@ -117,6 +123,19 @@ class OpenAIStreamTranslator:
         pending_content_ids = {id(chunk) for chunk in self.pending_content_chunks}
         self.pending_chunks = [chunk for chunk in self.pending_chunks if id(chunk) not in pending_content_ids]
         self.pending_content_chunks = []
+
+    def drain_pending(self) -> list[str]:
+        """Return and clear chunks that are safe to send immediately.
+
+        The OpenAI route uses this during live SSE streaming so parsed upstream
+        deltas are flushed to the client instead of waiting for finalization.
+        """
+        if not self.pending_chunks:
+            return []
+        chunks = self.pending_chunks
+        self.pending_chunks = []
+        self.pending_content_chunks = []
+        return chunks
 
     def on_delta(self, evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
         self._ensure_role_chunk()

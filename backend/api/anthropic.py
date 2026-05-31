@@ -32,10 +32,33 @@ from backend.services.task_session import (
     plan_persistent_session_turn,
 )
 from backend.services.token_calc import count_tokens
+from backend.services.workspace_context import derive_workspace_root
 from backend.toolcall.normalize import build_tool_name_registry
 
 log = logging.getLogger("qwen2api.anthropic")
 router = APIRouter()
+
+
+def _tool_input_preview(input_data, *, limit: int = 260) -> str:
+    try:
+        raw = json.dumps(input_data if input_data is not None else {}, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        raw = repr(input_data)
+    return " ".join(raw.split())[:limit] + ("...[truncated]" if len(raw) > limit else "")
+
+
+def _log_response_tool_blocks(stage: str, blocks: list[dict]) -> None:
+    for idx, block in enumerate(blocks, start=1):
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        log.info(
+            "[ANT-ToolOut] stage=%s index=%s id=%s name=%s input=%s",
+            stage,
+            idx,
+            block.get("id", "-"),
+            block.get("name", "-"),
+            _tool_input_preview(block.get("input", {})),
+        )
 
 
 class _AnthropicStreamState:
@@ -125,8 +148,9 @@ class _AnthropicStreamState:
 
 
 def _build_standard_request(req_data: dict) -> StandardRequest:
-    """使用 CLIProxy 进行协议转换"""
+    """浣跨敤 CLIProxy 杩涜鍗忚杞崲"""
     standard_request = CLIProxy.from_anthropic(req_data, client_profile=CLAUDE_CODE_OPENAI_PROFILE)
+    standard_request.workspace_root = derive_workspace_root(req_data)
     CLIProxy.log_conversion("anthropic", standard_request.response_model, len(standard_request.prompt), len(standard_request.tools))
     return standard_request
 
@@ -149,7 +173,7 @@ async def _run_anthropic_attempt(
     max_attempts: int,
 ):
     update_request_context(stream_attempt=stream_attempt + 1)
-    execution = await collect_completion_run(client, standard_request, current_prompt)
+    execution = await collect_completion_run(client, standard_request, current_prompt, history_messages=history_messages)
     retry = evaluate_retry_directive(
         request=standard_request,
         current_prompt=current_prompt,
@@ -198,9 +222,9 @@ async def anthropic_count_tokens(request: Request):
     prompt_result = messages_to_prompt(req_data, client_profile=CLAUDE_CODE_OPENAI_PROFILE)
     base_tokens = count_tokens(prompt_result.prompt)
     # Context Pressure Inflation:
-    # Claude Code 假设 context window=200K，到 ~80%(160K) 触发自动压缩。
-    # 但 Qwen 实际上游 window 只有 ~150K，到 ~120K 时就开始挤压输出预算。
-    # 虚增 input_tokens 1.35x 让 CC 提前触发压缩，避免爆 window。
+    # Claude Code 鍋囪 context window=200K锛屽埌 ~80%(160K) 瑙﹀彂鑷姩鍘嬬缉銆?
+    # 浣?Qwen 瀹為檯涓婃父 window 鍙湁 ~150K锛屽埌 ~120K 鏃跺氨寮€濮嬫尋鍘嬭緭鍑洪绠椼€?
+    # 铏氬 input_tokens 1.35x 璁?CC 鎻愬墠瑙﹀彂鍘嬬缉锛岄伩鍏嶇垎 window銆?
     inflation = 1.35
     inflated = int(base_tokens * inflation)
     return JSONResponse({"input_tokens": inflated})
@@ -288,7 +312,17 @@ async def anthropic_messages(request: Request):
                 async with app.state.session_locks.hold(session_key):
                     standard_request, effective_payload, model_name, qwen_model, prompt, msg_id = await prepare_locked_request(req_data)
                     update_request_context(requested_model=model_name, resolved_model=qwen_model)
-                    log.info(f"[ANT] model={qwen_model}, stream={standard_request.stream}, tool_enabled={standard_request.tool_enabled}, tools={[t.get('name') for t in standard_request.tools]}, prompt_len={len(prompt)}")
+                    tool_names = [t.get('name') for t in standard_request.tools]
+                    log.info(
+                        "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s",
+                        qwen_model,
+                        standard_request.stream,
+                        standard_request.tool_enabled,
+                        tool_names,
+                        [name for name in tool_names if isinstance(name, str) and name.startswith("mcp__")],
+                        standard_request.workspace_root or "-",
+                        len(prompt),
+                    )
                     history_messages = original_history_messages
                     current_prompt = prompt
                     max_attempts = request_max_attempts(standard_request)
@@ -329,6 +363,7 @@ async def anthropic_messages(request: Request):
                                 max_continuation=2,
                                 warmup_chars=64,
                                 guard_chars=96,
+                                history_messages=history_messages,
                             )
                             retry = evaluate_retry_directive(
                                 request=standard_request,
@@ -341,11 +376,11 @@ async def anthropic_messages(request: Request):
                             )
                             if retry.retry:
                                 reused_persistent_chat = bool(standard_request.persistent_session and standard_request.upstream_chat_id)
-                                # 如果正在复用会话，重试时保留会话，避免删除后重建导致上下文丢失
+                                # 濡傛灉姝ｅ湪澶嶇敤浼氳瘽锛岄噸璇曟椂淇濈暀浼氳瘽锛岄伩鍏嶅垹闄ゅ悗閲嶅缓瀵艰嚧涓婁笅鏂囦涪澶?
                                 preserve_chat = reused_persistent_chat
                                 await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
                                 if reused_persistent_chat:
-                                    # 保留 upstream_chat_id，在同一会话中重试
+                                    # 淇濈暀 upstream_chat_id锛屽湪鍚屼竴浼氳瘽涓噸璇?
                                     # standard_request.session_chat_invalidated = True
                                     # standard_request.upstream_chat_id = None
                                     current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
@@ -357,13 +392,28 @@ async def anthropic_messages(request: Request):
                             if not stream_state.pending_chunks:
                                 stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))
 
-                            stream_state.close_current_block()
-                            directive = build_tool_directive(standard_request, execution.state)
+                            directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
+                            if (
+                                directive.stop_reason != "tool_use"
+                                and not stream_state.answer_text_buffer
+                                and execution.state.answer_text
+                            ):
+                                # ToolSieve may hold short normal replies until stream end to
+                                # avoid leaking partial tool markup. If no live text delta was
+                                # emitted, replay the finalized visible answer here.
+                                stream_state.buffer_answer_text(execution.state.answer_text)
+                            visible_answer_length = _visible_answer_text_length(
+                                directive=directive,
+                                execution=execution,
+                                stream_state=stream_state,
+                            )
                             if directive.stop_reason == "tool_use":
                                 stream_state.clear_answer_text()
+                                stream_state.close_current_block()
                                 stream_state.current_block = {"type": None, "index": None, "tool_call_id": None}
                             else:
                                 stream_state.flush_answer_text()
+                                stream_state.close_current_block()
                             expected_tool_ids = {
                                 block.get("id")
                                 for block in directive.tool_blocks
@@ -381,11 +431,8 @@ async def anthropic_messages(request: Request):
                                 )
                                 stream_state.close_current_block()
 
-                            visible_answer_length = _visible_answer_text_length(
-                                directive=directive,
-                                execution=execution,
-                                stream_state=stream_state,
-                            )
+                            _log_response_tool_blocks("stream_response", directive.tool_blocks)
+
                             stop_reason = "tool_use" if expected_tool_ids else "end_turn"
                             stream_state.pending_chunks.append(stream_presenter.anthropic_message_delta(stop_reason, visible_answer_length))
                             stream_state.pending_chunks.append(stream_presenter.anthropic_message_stop())
@@ -435,7 +482,17 @@ async def anthropic_messages(request: Request):
         async with app.state.session_locks.hold(session_key):
             standard_request, effective_payload, model_name, qwen_model, prompt, msg_id = await prepare_locked_request(req_data)
             update_request_context(requested_model=model_name, resolved_model=qwen_model)
-            log.info(f"[ANT] model={qwen_model}, stream={standard_request.stream}, tool_enabled={standard_request.tool_enabled}, tools={[t.get('name') for t in standard_request.tools]}, prompt_len={len(prompt)}")
+            tool_names = [t.get('name') for t in standard_request.tools]
+            log.info(
+                "[ANT] model=%s stream=%s tool_enabled=%s tools=%s mcp_tools=%s workspace=%s prompt_len=%s",
+                qwen_model,
+                standard_request.stream,
+                standard_request.tool_enabled,
+                tool_names,
+                [name for name in tool_names if isinstance(name, str) and name.startswith("mcp__")],
+                standard_request.workspace_root or "-",
+                len(prompt),
+            )
             history_messages = original_history_messages
             current_prompt = prompt
             max_attempts = request_max_attempts(standard_request)
@@ -451,11 +508,11 @@ async def anthropic_messages(request: Request):
                     )
                     if retry.retry:
                         reused_persistent_chat = bool(standard_request.persistent_session and standard_request.upstream_chat_id)
-                        # 如果正在复用会话，重试时保留会话，避免删除后重建导致上下文丢失
+                        # 濡傛灉姝ｅ湪澶嶇敤浼氳瘽锛岄噸璇曟椂淇濈暀浼氳瘽锛岄伩鍏嶅垹闄ゅ悗閲嶅缓瀵艰嚧涓婁笅鏂囦涪澶?
                         preserve_chat = reused_persistent_chat
                         await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
                         if reused_persistent_chat:
-                            # 保留 upstream_chat_id，在同一会话中重试
+                            # 淇濈暀 upstream_chat_id锛屽湪鍚屼竴浼氳瘽涓噸璇?
                             # standard_request.session_chat_invalidated = True
                             # standard_request.upstream_chat_id = None
                             current_prompt = build_retry_rebase_prompt(standard_request, reason=retry.reason)
@@ -464,7 +521,8 @@ async def anthropic_messages(request: Request):
                         await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                         continue
 
-                    directive = build_tool_directive(standard_request, execution.state)
+                    directive = build_tool_directive(standard_request, execution.state, history_messages=history_messages)
+                    _log_response_tool_blocks("json_response", directive.tool_blocks)
                     content_blocks: list[dict] = []
                     if execution.state.reasoning_text:
                         content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
@@ -511,3 +569,5 @@ async def anthropic_messages(request: Request):
                     if stream_attempt == max_attempts - 1:
                         await clear_invalidated_session_chat(app=app, request=standard_request)
                         raise HTTPException(status_code=500, detail=str(e))
+
+

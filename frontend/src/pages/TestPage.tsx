@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "../components/ui/button"
 import { Send, RefreshCw, Bot } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
@@ -19,7 +19,7 @@ function MessageContent({ content }: { content: string }) {
     return <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
   }
 
-  const nodes: JSX.Element[] = []
+  const nodes: ReactNode[] = []
   let cursor = 0
   segs.forEach((seg, i) => {
     if (seg.start > cursor) {
@@ -156,7 +156,7 @@ export default function TestPage() {
                     return msgs
                   })
                 }
-              } catch (_) { /* skip */ }
+              } catch { /* skip */ }
             }
           }
         }
@@ -169,9 +169,10 @@ export default function TestPage() {
           })
         }
       }
-    } catch (err: any) {
-      toast.error(`网络错误: ${err.message}`)
-      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${err.message}`, error: true }])
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "未知错误"
+      toast.error(`网络错误: ${message}`)
+      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${message}`, error: true }])
     } finally {
       setLoading(false)
     }
