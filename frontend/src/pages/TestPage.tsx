@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback, type ReactNode } from "react"
 import { Button } from "../components/ui/button"
-import { Send, RefreshCw, Bot, ImagePlus, X, Wand2, Plus, Paperclip } from "lucide-react"
+import { Send, RefreshCw, Bot, X, Wand2, Plus, Paperclip } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
