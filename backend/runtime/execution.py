@@ -1509,6 +1509,9 @@ async def continue_after_retry_directive(*, client, execution, retry: RuntimeRet
 async def cleanup_runtime_resources(client, acc, chat_id: str | None, *, preserve_chat: bool = False) -> None:
     if acc is None:
         return
+    # 匿名模式的 acc 是 dict，不需要 release
+    if isinstance(acc, dict):
+        return
     token = getattr(acc, "token", None)
     client.account_pool.release(acc)
     if preserve_chat:

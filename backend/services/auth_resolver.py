@@ -403,6 +403,84 @@ class _AsyncMailClient:
     async def get_verify_link_for_email(self, email: str, timeout_sec: int = 300) -> str:
         return await asyncio.to_thread(self._sess.poll_verify_link, email, timeout_sec)
 
+async def get_anonymous_token() -> Optional[str]:
+    """获取匿名 token — 通过 Camoufox 访问访客页面，从 localStorage 提取 token"""
+    log.info("[Anonymous] ── 开始获取匿名 token（浏览器方式） ──")
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] 启动 Camoufox 访问访客页面...")
+            from camoufox.async_api import AsyncCamoufox
+
+            camoufox_opts = {
+                "headless": True,
+                "humanize": False,
+                "i_know_what_im_doing": True,
+                "firefox_user_prefs": {
+                    "layers.acceleration.disabled": True,
+                    "gfx.webrender.enabled": False,
+                    "gfx.webrender.all": False,
+                    "gfx.webrender.software": False,
+                    "gfx.canvas.azure.backends": "skia",
+                    "media.hardware-video-decoding.enabled": False,
+                },
+            }
+
+            async with AsyncCamoufox(**camoufox_opts) as browser:
+                page = await browser.new_page()
+
+                # 1. 访问访客页面
+                guest_url = f"{BASE_URL}/c/guest"
+                log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] 访问 {guest_url}")
+                await page.goto(guest_url, wait_until="networkidle", timeout=60000)
+                await asyncio.sleep(3)
+                log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] 页面标题: {await page.title()}")
+
+                # 2. 尝试从 localStorage 提取 token
+                token = await page.evaluate("localStorage.getItem('token')")
+                if token:
+                    log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] ✓ 从 localStorage 获取到 token: {token[:30]}...")
+                    return token
+
+                # 3. 尝试从 auth 端点获取（带 cookies）
+                log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] localStorage 无 token，尝试 auth 端点...")
+                auth_result = await page.evaluate("""async () => {
+                    try {
+                        const resp = await fetch('/api/v1/auths/', { credentials: 'include' });
+                        if (resp.ok) return await resp.json();
+                    } catch(e) {}
+                    return null;
+                }""")
+                if auth_result and auth_result.get("token"):
+                    token = auth_result["token"]
+                    log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] ✓ 从 auth 端点获取到 token: {token[:30]}...")
+                    return token
+
+                # 4. 提取 cookies 作为 fallback
+                cookies = await page.context.cookies()
+                if cookies:
+                    qwen_cookies = [c for c in cookies if "qwen" in c.get("domain", "")]
+                    if qwen_cookies:
+                        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in qwen_cookies)
+                        log.info(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] ✓ 获取到 cookies: {cookie_str[:50]}...")
+                        return cookie_str
+
+                log.warning(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] 未能获取匿名 token")
+
+        except Exception as e:
+            import traceback
+            log.error(f"[Anonymous] [尝试 {attempt + 1}/{max_retries}] 异常: {e}\n{traceback.format_exc()}")
+
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt
+            log.info(f"[Anonymous] 等待 {wait_time} 秒后重试...")
+            await asyncio.sleep(wait_time)
+
+    log.error("[Anonymous] 所有重试均失败")
+    return None
+
+
 async def register_qwen_account() -> Optional[Account]:
     log.info("[Register] ── 开始注册流程 ──")
     async with _AsyncMailClient() as mail_client:

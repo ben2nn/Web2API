@@ -1,8 +1,8 @@
 """
 图片生成接口 — 兼容 OpenAI /v1/images/generations 规范。
 
-底层通过现有直连 HTTP 聊天能力触发千问“生成图像”模式，
-不依赖浏览器运行时。
+底层通过现有直连 HTTP 聊天能力触发千问"生成图像"模式，
+不依赖浏览器运行时。匿名模式下支持多图并发生成。
 """
 import re
 import time
@@ -64,11 +64,33 @@ def _get_token(request: Request) -> str:
 
 
 def _build_image_prompt(prompt: str) -> str:
-    return (
-        "请直接生成图片，不要只输出文字描述。"
-        "如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n\n"
-        f"用户需求：{prompt}"
-    )
+    # 匿名模式通过 UI 切换到图片生成模式，提示词直接传用户需求
+    return prompt
+
+
+async def _generate_one_anonymous(prompt: str, aspect_ratio: str | None = None) -> str | None:
+    """匿名模式生成单张图片，返回图片 URL 或 None。
+
+    使用全局单例浏览器实例，避免每次调用都启动新浏览器（~20s）。
+    """
+    from backend.services.qwen_anonymous_client import get_anonymous_client
+
+    client = await get_anonymous_client()
+    try:
+        resp = await client.chat(
+            prompt,
+            timeout_sec=180,
+            mode="image",
+            aspect_ratio=aspect_ratio,
+        )
+        if not resp.success:
+            log.warning(f"[T2I] 匿名单图生成失败: {resp.error}")
+            return None
+        urls = _extract_image_urls(resp.content)
+        return urls[0] if urls else None
+    except Exception as e:
+        log.error(f"[T2I] 匿名单图生成异常: {e}")
+        return None
 
 
 @router.post("/v1/images/generations")
@@ -94,15 +116,31 @@ async def create_image(request: Request):
 
     n: int = min(max(int(body.get("n", 1)), 1), 4)
     model = _resolve_image_model(body.get("model"))
+    # 支持 ratio / aspect_ratio / 从 size 中解析
+    ratio = body.get("ratio") or body.get("aspect_ratio")
+    if not ratio:
+        size_str = body.get("size", "")
+        if "x" in str(size_str):
+            try:
+                w, h = str(size_str).lower().split("x")
+                w, h = int(w), int(h)
+                from math import gcd
+                g = gcd(w, h)
+                ratio = f"{w // g}:{h // g}"
+            except Exception:
+                pass
 
-    log.info(f"[T2I] model={model}, n={n}, prompt={prompt[:80]!r}")
+    log.info(f"[T2I] model={model}, n={n}, ratio={ratio}, prompt={prompt[:80]!r}")
 
     acc = None
     chat_id = None
     try:
         prompt_text = _build_image_prompt(prompt)
+
         event_payloads: list[str] = []
-        async for item in client.chat_stream_events_with_retry(model, prompt_text, has_custom_tools=False):
+        async for item in client.chat_stream_events_with_retry(
+            model, prompt_text, has_custom_tools=False, mode="image", aspect_ratio=ratio,
+        ):
             if item.get("type") == "meta":
                 acc = item.get("acc")
                 chat_id = item.get("chat_id")
@@ -114,13 +152,38 @@ async def create_image(request: Request):
         if acc is None or chat_id is None:
             raise HTTPException(status_code=500, detail="Image generation session was not created")
 
-        chats = await client.list_chats(acc.token, limit=20)
-        current_chat = next((c for c in chats if isinstance(c, dict) and c.get("id") == chat_id), None)
+        # 判断是否匿名
+        if isinstance(acc, dict):
+            acc_token = acc.get("token", "")
+        else:
+            acc_token = getattr(acc, "token", "")
+        is_anonymous = acc_token == "anonymous"
+
         answer_text = "\n".join(event_payloads)
-        if current_chat:
-            answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
+
+        # 非匿名模式尝试从 list_chats 获取更多图片信息
+        if not is_anonymous:
+            try:
+                chats = await client.list_chats(acc.token, limit=20)
+                current_chat = next((c for c in chats if isinstance(c, dict) and c.get("id") == chat_id), None)
+                if current_chat:
+                    answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
+            except Exception as e:
+                log.warning(f"[T2I] list_chats 失败（可能是匿名模式）: {e}")
+
         image_urls = _extract_image_urls(answer_text)
-        log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+        log.info(f"[T2I] 首次提取到 {len(image_urls)} 张图片 URL")
+
+        # 匿名模式 n>1：并发补充生成
+        if is_anonymous and n > 1 and len(image_urls) < n:
+            need = n - len(image_urls)
+            log.info(f"[T2I] 匿名并发补充生成 {need} 张图片 (ratio={ratio})")
+            extra_urls = await asyncio.gather(
+                *[_generate_one_anonymous(prompt, ratio) for _ in range(need)]
+            )
+            for u in extra_urls:
+                if u and u not in image_urls:
+                    image_urls.append(u)
 
         if not image_urls:
             raise HTTPException(status_code=500, detail="Image generation succeeded but no URL found")
@@ -135,6 +198,8 @@ async def create_image(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if acc is not None:
-            client.account_pool.release(acc)
-            if chat_id:
-                asyncio.create_task(client.delete_chat(acc.token, chat_id))
+            # 匿名模式的 acc 是 dict，不需要 release；Account 对象才需要
+            if not isinstance(acc, dict):
+                client.account_pool.release(acc)
+                if chat_id:
+                    asyncio.create_task(client.delete_chat(acc.token, chat_id))

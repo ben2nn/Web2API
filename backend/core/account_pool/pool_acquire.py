@@ -9,8 +9,7 @@ from typing import Optional, TYPE_CHECKING
 
 from backend.core.config import settings
 
-if TYPE_CHECKING:
-    from backend.core.account_pool.pool_core import Account
+from backend.core.account_pool.pool_core import Account
 
 log = logging.getLogger("qwen2api.accounts.acquire")
 
@@ -57,7 +56,16 @@ class AccountAcquireMixin:
             # 筛选可用账号
             available = [a for a in self.accounts if a.is_available() and (not exclude or a.email not in exclude)]
             if not available:
-                return None
+                # 没有可用账号，使用匿名访客模式
+                log.info("[AccountPool] 没有可用账号，使用匿名访客模式")
+                return Account(
+                    email="anonymous@qwen",
+                    password="",
+                    token="anonymous",
+                    cookies="",
+                    username="anonymous",
+                    activation_pending=False,
+                )
 
             # 筛选就绪账号（未达到并发上限且冷却完成）
             ready = [a for a in available if a.inflight < self.max_inflight_per_account and a.next_available_at() <= now]
@@ -116,6 +124,8 @@ class AccountAcquireMixin:
         等待获取账号（带超时）
         对齐 ds2api 的 AcquireWait() 逻辑
         """
+        from backend.core.config import settings
+
         deadline = time.time() + timeout
 
         while True:
@@ -128,7 +138,16 @@ class AccountAcquireMixin:
             async with self._lock:
                 candidates = [a for a in self.accounts if a.valid and (not exclude or a.email not in exclude)]
                 if not candidates:
-                    return None
+                    # 没有可用账号，使用匿名访客模式
+                    log.info("[AccountPool] 没有可用账号，使用匿名访客模式")
+                    return Account(
+                        email="anonymous@qwen",
+                        password="",
+                        token="anonymous",
+                        cookies="",
+                        username="anonymous",
+                        activation_pending=False,
+                    )
 
                 # 计算下次可用时间
                 next_ready_at = min((a.next_available_at() for a in candidates), default=time.time())
@@ -194,6 +213,10 @@ class AccountAcquireMixin:
         对齐 ds2api 的 Release() 逻辑
         """
         if not acc or not acc.email:
+            return
+
+        # 匿名账号不需要释放
+        if acc.email == "anonymous@qwen":
             return
 
         acc.inflight = max(0, acc.inflight - 1)

@@ -183,6 +183,110 @@ class QwenExecutor:
 
         log.info(f"[上游] 流结束 会话={chat_id} 总耗时={elapsed:.3f}s 流字节={total_output_chars}")
 
+    @staticmethod
+    def _extract_user_message(prompt: str) -> str:
+        """从格式化 prompt 中提取对话内容
+
+        prompt_builder 生成的格式: <system>...\\nHuman: <消息>\\nAssistant: <回复>\\nHuman: <消息>\\nAssistant:
+        匿名模式需要保留完整对话上下文，将多轮对话转换为可读格式。
+        """
+        import re
+
+        # 移除 system 标记
+        text = prompt
+        text = re.sub(r'<system>.*?</system>', '', text, flags=re.DOTALL).strip()
+
+        # 提取所有 Human/Assistant 对话
+        messages = []
+        # 分割成 Human 和 Assistant 部分
+        parts = re.split(r'(Human:|Assistant:)', text)
+
+        current_role = None
+        for part in parts:
+            part = part.strip()
+            if part == 'Human:':
+                current_role = 'user'
+            elif part == 'Assistant:':
+                current_role = 'assistant'
+            elif part and current_role:
+                # 清理内容
+                content = part.strip()
+                # 移除末尾的 Assistant: 标记
+                content = re.sub(r'\s*Assistant:\s*$', '', content).strip()
+                if content:
+                    messages.append((current_role, content))
+
+        if messages:
+            # 格式化为可读的对话历史
+            formatted = []
+            for role, content in messages:
+                if role == 'user':
+                    formatted.append(f"用户: {content}")
+                else:
+                    formatted.append(f"助手: {content}")
+            result = '\n\n'.join(formatted)
+            log.info(f"[上游] 提取对话历史: {len(messages)} 条消息, {len(result)} 字")
+            return result
+
+        # 兜底：去掉 system/tool_call 等前缀
+        lines = prompt.strip().split('\n')
+        user_lines = [l for l in lines if not l.startswith('<system>') and not l.startswith('</system>')
+                      and not l.startswith('##TOOL_CALL##') and l.strip()]
+        return '\n'.join(user_lines[-5:]).strip() if user_lines else prompt.strip()
+
+    async def _stream_via_anonymous(self, content: str, model: str, mode: str | None = None, file_path: str | None = None, aspect_ratio: str | None = None):
+        """通过 Camoufox 匿名访客模式流式聊天
+
+        Args:
+            mode: "image" 切换到图片生成模式，None 为普通聊天
+            file_path: 要上传的文件路径，None 表示不上传
+            aspect_ratio: 图片比例，如 "16:9", "1:1", "9:16" 等
+        """
+        from backend.services.qwen_anonymous_client import get_anonymous_client
+
+        client = await get_anonymous_client()
+
+        # 从格式化 prompt 中提取原始用户消息（网页 UI 需要纯文本）
+        user_message = self._extract_user_message(content)
+        if user_message != content.strip():
+            log.info(f"[上游] 匿名模式提取用户消息: {repr(user_message[:80])} (原 prompt {len(content)} 字)")
+        content = user_message
+
+        chat_id = f"anonymous-{int(time.time() * 1000)}"
+        yield {
+            "type": "meta",
+            "chat_id": chat_id,
+            "acc": {
+                "email": "anonymous@qwen",
+                "token": "anonymous",
+            },
+        }
+
+        # 根据模式设置超时时间
+        timeout_sec = 120
+        if mode == "image":
+            timeout_sec = 180
+        elif file_path:
+            timeout_sec = 150
+
+        log.info(f"[上游] 匿名模式开始 stream 模式={mode} 超时={timeout_sec}s")
+
+        async for chunk in client.chat_stream(content, timeout_sec=timeout_sec, mode=mode, file_path=file_path, aspect_ratio=aspect_ratio):
+            if "error" in chunk:
+                raise Exception(chunk["error"])
+            elif "content" in chunk:
+                yield {
+                    "type": "event",
+                    "event": {
+                        "type": "delta",
+                        "phase": "answer",
+                        "content": chunk["content"],
+                    },
+                }
+            elif chunk.get("done"):
+                yield {"type": "event", "event": {"type": "done"}}
+                break
+
     async def chat_stream_events_with_retry(
         self,
         model: str,
@@ -191,6 +295,8 @@ class QwenExecutor:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        mode: str | None = None,
+        aspect_ratio: str | None = None,
     ):
         exclude = set()
         if fixed_account is not None:
@@ -223,6 +329,33 @@ class QwenExecutor:
             acquire_elapsed = time.perf_counter() - acquire_start
             if not acc:
                 raise Exception("No available accounts in pool (all busy or rate limited)")
+
+            # 检查是否是匿名模式
+            if acc.token == "anonymous":
+                log.info(f"[上游] 使用匿名访客模式 模型={model}")
+                try:
+                    # 提取第一个文件路径（匿名模式只支持单文件）
+                    file_path = None
+                    if files and len(files) > 0:
+                        first_file = files[0]
+                        if isinstance(first_file, dict):
+                            file_path = first_file.get("path") or first_file.get("file_path")
+                            # 兼容：如果 files 中有 aspect_ratio 且外部未传入，使用 files 中的
+                            if aspect_ratio is None:
+                                aspect_ratio = first_file.get("aspect_ratio")
+                        elif isinstance(first_file, str):
+                            file_path = first_file
+
+                    log.info(f"[上游] 匿名模式参数 file_path={file_path} aspect_ratio={aspect_ratio}")
+
+                    async for evt in self._stream_via_anonymous(content, model, mode=mode, file_path=file_path, aspect_ratio=aspect_ratio):
+                        yield evt
+                    return
+                except Exception as e:
+                    log.error(f"[上游] 匿名模式失败: {e}")
+                    raise
+                finally:
+                    self.account_pool.release(acc)
 
             try:
                 log.info(f"[上游] 账号已获取 账号={acc.email} 模型={model} 第{attempt + 1}次 获取耗时={acquire_elapsed:.3f}s")

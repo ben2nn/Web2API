@@ -373,6 +373,8 @@ class QwenClient:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        mode: str | None = None,
+        aspect_ratio: str | None = None,
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
@@ -381,5 +383,7 @@ class QwenClient:
             files=files,
             fixed_account=fixed_account,
             existing_chat_id=existing_chat_id,
+            mode=mode,
+            aspect_ratio=aspect_ratio,
         ):
             yield item
