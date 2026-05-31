@@ -284,6 +284,11 @@ class QwenExecutor:
                     },
                 }
             elif chunk.get("done"):
+                log.info(
+                    "[upstream] anonymous stream finished reason=%s final_chars=%s",
+                    chunk.get("reason", "done"),
+                    len(chunk.get("final_content") or ""),
+                )
                 yield {"type": "event", "event": {"type": "done"}}
                 break
 
@@ -297,6 +302,7 @@ class QwenExecutor:
         existing_chat_id: str | None = None,
         mode: str | None = None,
         aspect_ratio: str | None = None,
+        attachments: list | None = None,
     ):
         exclude = set()
         if fixed_account is not None:
@@ -345,6 +351,15 @@ class QwenExecutor:
                                 aspect_ratio = first_file.get("aspect_ratio")
                         elif isinstance(first_file, str):
                             file_path = first_file
+
+                    # 兜底：从 attachments 中获取 local_path（匿名模式无法通过 API 上传，upstream_files 为空）
+                    if not file_path and attachments:
+                        for att in attachments:
+                            att_path = getattr(att, "local_path", None)
+                            if att_path:
+                                file_path = att_path
+                                log.info(f"[上游] 从 attachments 获取文件路径: {att_path}")
+                                break
 
                     log.info(f"[上游] 匿名模式参数 file_path={file_path} aspect_ratio={aspect_ratio}")
 

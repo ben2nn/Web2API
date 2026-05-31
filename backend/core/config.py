@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     WORKERS: int = int(os.getenv("WORKERS", 3))
     ADMIN_KEY: str = os.getenv("ADMIN_KEY", "admin")
 
+    # 管理员登录凭据
+    ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "admin")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
+
     # 浏览器自动化配置
     USE_BROWSER_AUTOMATION: bool = os.getenv("USE_BROWSER_AUTOMATION", "false").lower() == "true"
     BROWSER_TIMEOUT: int = int(os.getenv("BROWSER_TIMEOUT", "120"))

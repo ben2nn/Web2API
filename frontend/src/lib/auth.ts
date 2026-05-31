@@ -3,6 +3,15 @@ export function getAuthHeader() {
   return { Authorization: `Bearer ${key}` };
 }
 
+export function isLoggedIn(): boolean {
+  return !!localStorage.getItem('qwen2api_key');
+}
+
+export function logout() {
+  localStorage.removeItem('qwen2api_key');
+  window.location.href = '/login';
+}
+
 export function isAnonymousEnabled(): boolean {
   return localStorage.getItem('qwen2api_anonymous') === 'true';
 }

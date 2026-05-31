@@ -53,6 +53,23 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     acc = await account_pool.acquire_wait_preferred(preferred_email, timeout=60)
     if not acc:
         raise RuntimeError("No available upstream account for context attachment mode")
+
+    # 匿名账号无法通过 API 上传文件，跳过上传，保留附件信息供匿名模式通过浏览器上传
+    is_anonymous = getattr(acc, "token", "") == "anonymous"
+    if is_anonymous:
+        account_pool.release(acc)
+        return {
+            "payload": payload,
+            "session_key": session_key,
+            "context_mode": "inline",
+            "upstream_files": list(payload.get("upstream_files", []) or []),
+            "bound_account": None,
+            "bound_account_email": None,
+            "generated_local_files": [],
+            "attachment_fallback": False,
+            "attachments": manual_attachments,  # 保留附件信息，供匿名模式获取 local_path
+        }
+
     await affinity.bind_account(session_key, surface, acc.email, context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS)
 
     upstream_files = list(payload.get("upstream_files", []) or [])
@@ -120,26 +137,29 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     except Exception:
         account_pool.release(acc)
         fallback_payload = dict(payload)
-        summary_parts: list[str] = []
-        if use_generated_context_files and plan.summary_text:
-            summary_parts.append(plan.summary_text[:1200])
-        if manual_attachments:
-            names = ", ".join(att.filename for att in manual_attachments[:4])
-            summary_parts.append(f"User attachments were provided but attachment upload failed. Attachment names: {names}")
-        latest_text = summary_parts[0] if summary_parts else "Attachment upload failed. Continue with the available inline context only."
-        fallback_payload["messages"] = [{
-            "role": "user",
-            "content": f"{latest_text}\n\n{SYSTEM_CONTEXT_PROMPT_NOTE}"
-        }]
+        # 保留原始消息（匿名模式会通过浏览器上传附件，不需要替换消息）
+        # 仅在没有附件时添加上下文提示
+        if not manual_attachments:
+            summary_parts: list[str] = []
+            if use_generated_context_files and plan.summary_text:
+                summary_parts.append(plan.summary_text[:1200])
+            latest_text = summary_parts[0] if summary_parts else "Attachment upload failed. Continue with the available inline context only."
+            fallback_payload["messages"] = [{
+                "role": "user",
+                "content": f"{latest_text}\n\n{SYSTEM_CONTEXT_PROMPT_NOTE}"
+            }]
+        # 保留附件的 local_path，供匿名模式使用（匿名模式通过浏览器上传本地文件）
+        fallback_upstream_files = list(payload.get("upstream_files", []) or [])
         return {
             "payload": fallback_payload,
             "session_key": session_key,
             "context_mode": "inline",
-            "upstream_files": list(payload.get("upstream_files", []) or []),
+            "upstream_files": fallback_upstream_files,
             "bound_account": None,
             "bound_account_email": None,
             "generated_local_files": [],
             "attachment_fallback": True,
+            "attachments": manual_attachments,  # 保留附件信息，供匿名模式获取 local_path
         }
 
     rewritten = dict(payload)
@@ -153,4 +173,5 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         "bound_account_email": acc.email,
         "generated_local_files": local_file_records,
         "attachment_fallback": False,
+        "attachments": manual_attachments,  # 保留附件信息
     }

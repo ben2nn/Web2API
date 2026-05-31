@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom"
 import { Toaster } from "sonner"
 import AdminLayout from "./layouts/AdminLayout"
+import ProtectedRoute from "./components/ProtectedRoute"
+import LoginPage from "./pages/LoginPage"
 import Dashboard from "./pages/Dashboard"
 import AccountsPage from "./pages/AccountsPage"
 import TestPage from "./pages/TestPage"
@@ -14,7 +16,8 @@ function App() {
       <Toaster position="top-center" richColors />
       <BrowserRouter>
         <Routes>
-          <Route path="/" element={<AdminLayout />}>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/" element={<ProtectedRoute><AdminLayout /></ProtectedRoute>}>
             <Route index element={<Dashboard />} />
             <Route path="accounts" element={<AccountsPage />} />
             <Route path="tokens" element={<TokensPage />} />

@@ -7,6 +7,19 @@ import secrets
 
 router = APIRouter()
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@router.post("/login")
+async def login(req: LoginRequest):
+    """管理员登录，验证用户名密码后返回 token"""
+    from backend.core.config import settings as backend_settings
+
+    if req.username == backend_settings.ADMIN_USERNAME and req.password == backend_settings.ADMIN_PASSWORD:
+        return {"ok": True, "token": backend_settings.ADMIN_KEY}
+    raise HTTPException(status_code=401, detail="用户名或密码错误")
+
 def verify_admin(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")

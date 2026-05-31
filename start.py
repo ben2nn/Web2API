@@ -132,7 +132,7 @@ def fetch_browser():
 
 
 def start_frontend() -> subprocess.Popen:
-    print("[STEP 3/5] 启动前端开发服务器...")
+    print("[STEP 5/5] 启动前端开发服务器...")
     is_windows = os.name == "nt"
 
     if not (FRONTEND_DIR / "node_modules").exists():

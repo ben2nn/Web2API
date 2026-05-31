@@ -13,10 +13,10 @@ import time
 from typing import AsyncIterator, Optional
 from dataclasses import dataclass
 
-log = logging.getLogger("qwen2api.anonymous")
+log = logging.getLogger("Web2API.anonymous")
 
 BASE_URL = "https://chat.qwen.ai"
-GUEST_URL = f"{BASE_URL}"
+GUEST_URL = f"{BASE_URL}/c/guest"
 
 _CAMOUFOX_OPTS = {
     "headless": True,
@@ -125,6 +125,12 @@ class QwenAnonymousClient:
         for _ in range(self._pool_size):
             page = await self._create_tab()
             if page:
+                try:
+                    await page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(0.5)
+                    await self._dismiss_popup_on_page(page)
+                except Exception as e:
+                    log.warning(f"[Anonymous] warm-up tab navigation failed: {e}")
                 self._tab_pool.append(page)
         log.info(f"[Anonymous] 页签池预热完成 (可用: {len(self._tab_pool)}/{self._pool_size})")
 
@@ -154,10 +160,9 @@ class QwenAnonymousClient:
 
         # 导航到访客页（失败时重建该页签）
         try:
-            await page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(0.5)
             current_url = page.url
-            if '/c/' not in current_url:
+            is_landing = current_url.rstrip('/') in (BASE_URL, f"{BASE_URL}/")
+            if is_landing or '/c/' not in current_url:
                 log.warning(f"[Anonymous] 页面被重定向到 {current_url}，重试导航")
                 await page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(0.5)
@@ -654,33 +659,46 @@ class QwenAnonymousClient:
         return False
 
     async def _verify_upload(self) -> bool:
-        """验证文件是否上传成功"""
-        await asyncio.sleep(2)
-        upload_status = await self._page.evaluate(r"""() => {
-            const result = { files: [], hasFileCard: false };
-            const fileCards = document.querySelectorAll('.file-card-list .fileitem-btn, .fileitem-btn');
-            result.hasFileCard = fileCards.length > 0;
-            fileCards.forEach(card => {
-                const nameEl = card.querySelector('.fileitem-file-name-text');
-                const extEl = card.querySelector('.fileitem-file-name-ext');
-                const sizeEl = card.querySelector('.fileitem-file-size span');
-                result.files.push({
-                    name: nameEl ? nameEl.textContent.trim() : '',
-                    ext: extEl ? extEl.textContent.trim() : '',
-                    size: sizeEl ? sizeEl.textContent.trim() : '',
-                });
-            });
-            return result;
-        }""")
+        """验证文件是否上传成功（带重试）"""
+        for attempt in range(10):
+            await asyncio.sleep(2 if attempt == 0 else 1.5)
+            upload_status = await self._page.evaluate(r"""() => {
+                const result = { files: [], hasFileCard: false };
 
-        if upload_status['hasFileCard']:
-            log.info(f"[Anonymous] 检测到 {len(upload_status['files'])} 个已上传文件:")
-            for f in upload_status['files']:
-                log.info(f"  - {f['name']}{f['ext']} ({f['size']})")
-            return True
-        else:
-            log.info("[Anonymous] 未检测到文件卡片")
-            return False
+                // 检测 file-card-list 容器内的 vision-item-container（实际 DOM 结构）
+                const fileCardList = document.querySelector('.file-card-list');
+                if (fileCardList) {
+                    const items = fileCardList.querySelectorAll('.vision-item-container');
+                    result.hasFileCard = items.length > 0;
+                    items.forEach(item => {
+                        const img = item.querySelector('.vision-item-image');
+                        result.files.push({ name: img ? img.alt : '' });
+                    });
+                }
+
+                // 兜底：直接检测 vision-item-container
+                if (!result.hasFileCard) {
+                    const altItems = document.querySelectorAll('.vision-item-container');
+                    result.hasFileCard = altItems.length > 0;
+                    altItems.forEach(item => {
+                        const img = item.querySelector('.vision-item-image, img');
+                        if (img) result.files.push({ name: img.alt || '' });
+                    });
+                }
+
+                return result;
+            }""")
+
+            if upload_status['hasFileCard']:
+                log.info(f"[Anonymous] 检测到 {len(upload_status['files'])} 个已上传文件:")
+                for f in upload_status['files']:
+                    log.info(f"  - {f['name']}")
+                return True
+
+            log.info(f"[Anonymous] 等待文件处理... (attempt={attempt + 1}/10)")
+
+        log.warning("[Anonymous] 上传验证超时，继续发送")
+        return True  # 不阻塞流程，允许继续发送
 
     # ── 输入与发送 ──
 
@@ -783,7 +801,7 @@ class QwenAnonymousClient:
         log.info("[Anonymous] 开始发送消息...")
 
         # 等待 React 处理输入状态
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
         # 优先用 Enter 键发送（对 React 受控输入框更可靠）
         # 先确认输入框有内容
@@ -841,13 +859,10 @@ class QwenAnonymousClient:
         url_after = self._page.url
         log.info(f"[Anonymous] 发送后 URL: {url_after}")
 
-        # 如果 URL 没变且仍在 new-chat，可能消息没发出去，尝试 Enter 重发
+        # If the page stays on new-chat, keep waiting; a second Enter can duplicate the request.
         if url_after == url_before and 'new-chat' in url_after:
-            log.warning("[Anonymous] URL 未变化，尝试 Enter 重发")
-            await self._page.keyboard.press('Enter')
-            await asyncio.sleep(2)
-            url_after2 = self._page.url
-            log.info(f"[Anonymous] 重发后 URL: {url_after2}")
+            log.info("[Anonymous] URL unchanged after send; waiting for response without resubmitting")
+            return
 
         # 检查同上下文下的其他页面
         try:
@@ -1170,20 +1185,9 @@ class QwenAnonymousClient:
         # 如果跳转到着陆页，说明发送失败
         is_landing = current_url.rstrip('/') in ('https://chat.qwen.ai', 'https://chat.qwen.ai/') or '/c/' not in current_url
         if is_landing:
-            log.warning(f"[Anonymous] 页面跳转到着陆页: {current_url}，尝试重新导航到访客页")
-            try:
-                await self._page.goto(GUEST_URL, wait_until="networkidle", timeout=30000)
-                await self._page.wait_for_selector('textarea, [contenteditable="true"]', timeout=10000)
-                if not await self._type_message(user_message or ""):
-                    yield {"error": "重新输入失败"}
-                    return
-                if not await self._send_message():
-                    yield {"error": "重新发送失败"}
-                    return
-                await asyncio.sleep(2)
-            except Exception as e:
-                yield {"error": f"页面跳转到着陆页且恢复失败: {e}"}
-                return
+            log.warning(f"[Anonymous] page returned to landing after send: {current_url}; stop to avoid duplicate submit")
+            yield {"error": f"page returned to landing after send: {current_url}"}
+            return
 
         # ── 图片生成模式：轮询图片 URL ──
         if mode == "image":
@@ -1219,7 +1223,7 @@ class QwenAnonymousClient:
                     image_urls = [f"![image]({img['src']})" for img in images]
                     content = "\n".join(image_urls)
                     yield {"content": content}
-                    yield {"done": True}
+                    yield {"done": True, "final_content": content, "reason": "image_found"}
                     return
 
                 if is_generating:
@@ -1239,7 +1243,7 @@ class QwenAnonymousClient:
 
             log.warning(f"[Anonymous] 图片生成超时 ({timeout_sec}s)")
             if last_content:
-                yield {"done": True}
+                yield {"done": True, "final_content": last_content, "reason": "image_timeout_with_content"}
             else:
                 yield {"error": "回复超时或为空"}
             return
@@ -1250,7 +1254,7 @@ class QwenAnonymousClient:
             if not self._page:
                 log.warning("[Anonymous] 页签已释放，停止流式等待")
                 if last_content:
-                    yield {"done": True}
+                    yield {"done": True, "final_content": last_content, "reason": "page_released_with_content"}
                 else:
                     yield {"error": "页签已释放"}
                 return
@@ -1287,7 +1291,7 @@ class QwenAnonymousClient:
                     stable_count += 1
                     if stable_count >= 7:
                         log.info(f"[Anonymous] 流式完成 (轮询稳定)")
-                        yield {"done": True}
+                        yield {"done": True, "final_content": last_content, "reason": "poll_stable"}
                         return
 
                 await asyncio.sleep(0.2)
@@ -1328,12 +1332,12 @@ class QwenAnonymousClient:
                         # 生成结束且内容稳定，判定完成
                         if not generating and stable_count >= 3:
                             log.info(f"[Anonymous] 流式完成 (生成结束，内容稳定)")
-                            yield {"done": True}
+                            yield {"done": True, "final_content": last_content, "reason": "generation_stopped"}
                             return
                         # 生成中但内容长时间不变，可能是思考阶段
                         if generating and stable_count >= 30:
                             log.info(f"[Anonymous] 流式完成 (内容长时间稳定)")
-                            yield {"done": True}
+                            yield {"done": True, "final_content": last_content, "reason": "content_stable_while_generating"}
                             return
                     # else: 没内容或内容变短，继续等
                 except Exception as e:
@@ -1351,14 +1355,14 @@ class QwenAnonymousClient:
                     elif content and content == last_content:
                         stable_count += 1
                         if stable_count >= 7:
-                            yield {"done": True}
+                            yield {"done": True, "final_content": last_content, "reason": "fallback_stable"}
                             return
 
             await asyncio.sleep(0.15)
 
         log.warning(f"[Anonymous] 流式超时 ({timeout_sec}s)")
         if last_content:
-            yield {"done": True}
+            yield {"done": True, "final_content": last_content, "reason": "timeout_with_content"}
         else:
             yield {"error": "回复超时或为空"}
 
