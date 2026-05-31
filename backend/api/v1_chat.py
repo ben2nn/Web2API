@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+import asyncio
 import json
 import logging
 import time
@@ -144,22 +145,58 @@ async def chat_completions(request: Request):
                             allowed_tool_names=standard_request.tool_names,
                         )
 
+                        # 使用队列实现真正的流式返回
+                        chunk_queue = asyncio.Queue()
+
                         async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
                             translator.on_delta(evt, text_chunk, tool_calls)
+                            # 立即将新产生的 chunk 放入队列
+                            while translator.pending_chunks:
+                                chunk = translator.pending_chunks.pop(0)
+                                await chunk_queue.put(chunk)
 
-                        result = await run_retryable_completion_bridge(
-                            client=client,
-                            standard_request=standard_request,
-                            prompt=prompt,
-                            users_db=users_db,
-                            token=token,
-                            history_messages=history_messages,
-                            max_attempts=request_max_attempts(standard_request),
-                            usage_delta_factory=build_usage_delta_factory(prompt),
-                            allow_after_visible_output=True,
-                            capture_events=False,
-                            on_delta=on_delta,
-                        )
+                        async def run_bridge():
+                            try:
+                                result = await run_retryable_completion_bridge(
+                                    client=client,
+                                    standard_request=standard_request,
+                                    prompt=prompt,
+                                    users_db=users_db,
+                                    token=token,
+                                    history_messages=history_messages,
+                                    max_attempts=request_max_attempts(standard_request),
+                                    usage_delta_factory=build_usage_delta_factory(prompt),
+                                    allow_after_visible_output=True,
+                                    capture_events=False,
+                                    on_delta=on_delta,
+                                )
+                                return result
+                            except Exception as e:
+                                await chunk_queue.put(("error", str(e)))
+                                return None
+
+                        # 启动 bridge 任务
+                        bridge_task = asyncio.create_task(run_bridge())
+
+                        # 持续从队列读取 chunk 并 yield
+                        while True:
+                            try:
+                                item = await asyncio.wait_for(chunk_queue.get(), timeout=0.1)
+                                if isinstance(item, tuple) and item[0] == "error":
+                                    yield f"data: {json.dumps({'error': item[1]})}\n\n"
+                                    return
+                                yield item
+                            except asyncio.TimeoutError:
+                                # 检查任务是否完成
+                                if bridge_task.done():
+                                    break
+                                continue
+
+                        # 获取结果
+                        result = await bridge_task
+                        if result is None:
+                            return
+
                         execution = result.execution
                         directive = result.directive or build_tool_directive(standard_request, execution.state)
                         assistant_message = build_openai_assistant_history_message(
@@ -175,6 +212,7 @@ async def chat_completions(request: Request):
                             assistant_message=assistant_message,
                         )
                         final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
+                        # 发送 finalize 的剩余 chunk（如 finish_reason 和 [DONE]）
                         for chunk in translator.finalize(final_finish_reason):
                             yield chunk
                         return

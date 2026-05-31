@@ -9,6 +9,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.venv/
+venv/
 
 # Data and Logs
 data/*.json
@@ -43,3 +45,13 @@ fix_*.py
 # local cleanup
 tests/
 docs/superpowers/
+
+# Browser automation
+browser_data/
+cookies/
+tokens/
+
+# Documentation
+FINAL_SUMMARY.md
+COMPATIBILITY_FIX.md
+SUMMARY.md

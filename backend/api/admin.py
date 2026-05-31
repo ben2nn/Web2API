@@ -323,6 +323,21 @@ async def get_keys():
     from backend.core.config import API_KEYS
     return {"keys": list(API_KEYS)}
 
+
+@router.post("/anonymous/token")
+async def get_anonymous_token_endpoint(request: Request):
+    """获取匿名访问 token（无需登录）"""
+    from backend.services.auth_resolver import get_anonymous_token
+
+    try:
+        token = await get_anonymous_token()
+        if token:
+            return {"token": "admin"}  # 返回 admin token 用于前端访问
+        else:
+            raise HTTPException(status_code=500, detail="Failed to get anonymous token")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/keys", dependencies=[Depends(verify_admin)])
 async def create_key():
     from backend.core.config import API_KEYS, save_api_keys

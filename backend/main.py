@@ -67,6 +67,20 @@ async def lifespan(app: FastAPI):
         app.state.qwen_executor.chat_id_pool = app.state.chat_id_pool  # 让 executor 直接访问
         await app.state.chat_id_pool.start()
 
+        # 预热匿名浏览器（后台执行，不阻塞启动）
+        async def _prewarm_anonymous():
+            try:
+                from backend.services.qwen_anonymous_client import get_anonymous_client
+                client = await get_anonymous_client()
+                ok = await client.start()
+                if ok:
+                    log.info("[启动] 匿名浏览器预热完成")
+                else:
+                    log.warning("[启动] 匿名浏览器预热失败（不影响正常启动，首次请求时会重试）")
+            except Exception as e:
+                log.warning(f"[启动] 匿名浏览器预热异常（不影响正常启动）: {e}")
+        asyncio.create_task(_prewarm_anonymous())
+
     yield
 
     with request_context(surface="shutdown"):
@@ -75,6 +89,12 @@ async def lifespan(app: FastAPI):
         pool = getattr(app.state, "chat_id_pool", None)
         if pool:
             await pool.stop()
+        # 关闭匿名浏览器
+        try:
+            from backend.services.qwen_anonymous_client import close_anonymous_client
+            await close_anonymous_client()
+        except Exception:
+            pass
         # 关闭 HTTP 连接池
         await app.state.qwen_client._http_client.aclose()
         log.info("HTTP 连接池已关闭")

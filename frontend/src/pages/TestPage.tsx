@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Button } from "../components/ui/button"
 import { Send, RefreshCw, Bot } from "lucide-react"
-import { getAuthHeader } from "../lib/auth"
+import { getAuthHeader, isAnonymousEnabled } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
 
@@ -62,7 +62,8 @@ export default function TestPage() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`${API_BASE}/v1/models`, { headers: getAuthHeader() })
+        const headers = getAuthHeader()
+        const r = await fetch(`${API_BASE}/v1/models`, { headers })
         if (!r.ok) return
         const j = await r.json()
         const ids = (j?.data || [])

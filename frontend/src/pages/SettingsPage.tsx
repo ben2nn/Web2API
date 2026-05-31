@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Settings2, RefreshCw, KeyRound, ServerCrash, Code } from "lucide-react"
+import { Settings2, RefreshCw, KeyRound, ServerCrash, Code, Shield, Globe } from "lucide-react"
 import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
@@ -13,9 +13,19 @@ export default function SettingsPage() {
   const [poolTarget, setPoolTarget] = useState(5)
   const [poolTtlMin, setPoolTtlMin] = useState(10)
   const [modelAliases, setModelAliases] = useState("")
+  const [anonymousEnabled, setAnonymousEnabled] = useState(false)
+  const [browserAutomationEnabled, setBrowserAutomationEnabled] = useState(false)
 
   const loadSessionKey = () => {
     setSessionKey(localStorage.getItem('qwen2api_key') || "")
+  }
+
+  const loadAnonymousSetting = () => {
+    setAnonymousEnabled(localStorage.getItem('qwen2api_anonymous') === 'true')
+  }
+
+  const loadBrowserAutomationSetting = () => {
+    setBrowserAutomationEnabled(localStorage.getItem('qwen2api_browser_automation') === 'true')
   }
 
   const fetchSettings = () => {
@@ -37,6 +47,8 @@ export default function SettingsPage() {
 
   useEffect(() => {
     loadSessionKey()
+    loadAnonymousSetting()
+    loadBrowserAutomationSetting()
     fetchSettings()
   }, [])
 
@@ -54,6 +66,28 @@ export default function SettingsPage() {
     localStorage.removeItem('qwen2api_key')
     setSessionKey("")
     toast.success("Key 已清除")
+  }
+
+  const handleToggleAnonymous = () => {
+    const newValue = !anonymousEnabled
+    setAnonymousEnabled(newValue)
+    localStorage.setItem('qwen2api_anonymous', String(newValue))
+    if (newValue) {
+      toast.success("匿名访问已启用，刷新页面后生效")
+    } else {
+      toast.success("匿名访问已禁用")
+    }
+  }
+
+  const handleToggleBrowserAutomation = () => {
+    const newValue = !browserAutomationEnabled
+    setBrowserAutomationEnabled(newValue)
+    localStorage.setItem('qwen2api_browser_automation', String(newValue))
+    if (newValue) {
+      toast.success("浏览器自动化已启用，刷新页面后生效")
+    } else {
+      toast.success("浏览器自动化已禁用")
+    }
   }
 
   const handleSaveConcurrency = () => {
@@ -217,6 +251,60 @@ export default function SettingsPage() {
               />
               <Button onClick={handleSaveSessionKey}>保存</Button>
               <Button variant="ghost" onClick={handleClearSessionKey}>清除</Button>
+            </div>
+          </div>
+        </div>
+
+        {/* Anonymous Access */}
+        <div className="rounded-xl border bg-card text-card-foreground shadow-sm min-w-0">
+          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+            <div className="flex items-center gap-2">
+              <Shield className="h-5 w-5 text-primary" />
+              <h3 className="font-semibold leading-none tracking-tight">匿名访问</h3>
+            </div>
+            <p className="text-sm text-muted-foreground">启用后，即使没有 API Key 也能访问服务。通过刷新浏览器获取新的匿名身份。</p>
+          </div>
+          <div className="p-6">
+            <div className="flex items-center justify-between">
+              <div className="space-y-1">
+                <span className="text-sm font-medium">启用匿名访问</span>
+                <p className="text-xs text-muted-foreground">
+                  {anonymousEnabled ? "已启用 - 无需 API Key 即可访问" : "已禁用 - 需要 API Key 才能访问"}
+                </p>
+              </div>
+              <Button
+                variant={anonymousEnabled ? "default" : "outline"}
+                onClick={handleToggleAnonymous}
+              >
+                {anonymousEnabled ? "禁用" : "启用"}
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        {/* Browser Automation */}
+        <div className="rounded-xl border bg-card text-card-foreground shadow-sm min-w-0">
+          <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
+            <div className="flex items-center gap-2">
+              <Globe className="h-5 w-5 text-primary" />
+              <h3 className="font-semibold leading-none tracking-tight">浏览器自动化</h3>
+            </div>
+            <p className="text-sm text-muted-foreground">启用后，当没有可用账号时，将通过浏览器自动化操作 Qwen 网页版获取回复。</p>
+          </div>
+          <div className="p-6">
+            <div className="flex items-center justify-between">
+              <div className="space-y-1">
+                <span className="text-sm font-medium">启用浏览器自动化</span>
+                <p className="text-xs text-muted-foreground">
+                  {browserAutomationEnabled ? "已启用 - 使用浏览器模拟用户操作" : "已禁用 - 仅使用 API 调用"}
+                </p>
+              </div>
+              <Button
+                variant={browserAutomationEnabled ? "default" : "outline"}
+                onClick={handleToggleBrowserAutomation}
+              >
+                {browserAutomationEnabled ? "禁用" : "启用"}
+              </Button>
             </div>
           </div>
         </div>

@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     WORKERS: int = int(os.getenv("WORKERS", 3))
     ADMIN_KEY: str = os.getenv("ADMIN_KEY", "admin")
 
+    # 浏览器自动化配置
+    USE_BROWSER_AUTOMATION: bool = os.getenv("USE_BROWSER_AUTOMATION", "false").lower() == "true"
+    BROWSER_TIMEOUT: int = int(os.getenv("BROWSER_TIMEOUT", "120"))
+
     # 并发配置（浏览器仅用于账号注册，不用于对话请求）
     BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 1))
     MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 2))

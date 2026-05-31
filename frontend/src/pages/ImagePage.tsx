@@ -6,11 +6,11 @@ import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 
 const ASPECT_RATIOS = [
-  { label: "1:1",  value: "1:1",   w: 1024, h: 1024 },
-  { label: "16:9", value: "16:9",  w: 1024, h: 576  },
-  { label: "9:16", value: "9:16",  w: 576,  h: 1024 },
-  { label: "4:3",  value: "4:3",   w: 1024, h: 768  },
-  { label: "3:4",  value: "3:4",   w: 768,  h: 1024 },
+  { label: "1:1",  value: "1:1"  },
+  { label: "16:9", value: "16:9" },
+  { label: "9:16", value: "9:16" },
+  { label: "4:3",  value: "4:3"  },
+  { label: "3:4",  value: "3:4"  },
 ]
 
 interface GeneratedImage {
@@ -27,9 +27,6 @@ export default function ImagePage() {
   const [images, setImages] = useState<GeneratedImage[]>([])
   const [error, setError] = useState<string | null>(null)
 
-  const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
-  const sizeStr = `${selectedRatio.w}x${selectedRatio.h}`
-
   const handleGenerate = async () => {
     if (!prompt.trim() || loading) return
     setLoading(true)
@@ -43,7 +40,7 @@ export default function ImagePage() {
           model: "dall-e-3",
           prompt: prompt.trim(),
           n,
-          size: sizeStr,
+          ratio,
           response_format: "url",
         }),
       })
@@ -154,11 +151,6 @@ export default function ImagePage() {
                 </button>
               ))}
             </div>
-          </div>
-
-          {/* 尺寸预览 */}
-          <div className="text-xs text-muted-foreground font-mono bg-muted/50 border rounded-md px-2 py-1">
-            {sizeStr}
           </div>
 
           {/* 生成按钮 */}
