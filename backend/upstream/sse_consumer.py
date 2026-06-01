@@ -1,7 +1,7 @@
 import json
 import logging
 
-log = logging.getLogger("qwen2api.sse")
+log = logging.getLogger("Web2API.sse")
 
 
 def parse_sse_chunk(chunk: str) -> list[dict]:

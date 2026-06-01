@@ -15,7 +15,7 @@ def _build_model_list_payload() -> dict:
         if model_id in seen:
             continue
         seen.add(model_id)
-        data.append({"id": model_id, "object": "model", "owned_by": "qwen2api"})
+        data.append({"id": model_id, "object": "model", "owned_by": "Web2API"})
     return {"object": "list", "data": data}
 
 
@@ -56,4 +56,4 @@ async def get_model(model_id: str):
     resolved = resolve_model(model_id)
     if resolved == model_id and model_id not in MODEL_MAP:
         raise HTTPException(status_code=404, detail={"error": {"message": f"Model '{model_id}' not found", "type": "invalid_request_error"}})
-    return JSONResponse({"id": model_id, "object": "model", "owned_by": "qwen2api", "resolved_model": resolved})
+    return JSONResponse({"id": model_id, "object": "model", "owned_by": "Web2API", "resolved_model": resolved})

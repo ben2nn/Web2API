@@ -11,7 +11,7 @@ from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.qwen_executor import QwenExecutor
 from backend.upstream.sse_consumer import parse_sse_chunk
 
-log = logging.getLogger("qwen2api.client")
+log = logging.getLogger("Web2API.client")
 
 
 class QwenClient:

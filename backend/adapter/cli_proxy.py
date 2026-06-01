@@ -11,7 +11,7 @@ from backend.services.prompt_builder import messages_to_prompt
 from backend.services.workspace_context import derive_workspace_root
 from backend.toolcall.normalize import build_tool_name_registry
 
-log = logging.getLogger("qwen2api.cli_proxy")
+log = logging.getLogger("Web2API.cli_proxy")
 
 
 class CLIProxy:

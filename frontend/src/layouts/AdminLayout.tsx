@@ -30,7 +30,7 @@ export default function AdminLayout() {
         mobileOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
       }`}>
         <div className="h-16 flex items-center justify-between px-6 border-b border-border/40">
-          <div className="font-extrabold text-xl tracking-tight bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">qwen2API</div>
+          <div className="font-extrabold text-xl tracking-tight bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">Web2API</div>
           <button className="md:hidden text-muted-foreground hover:text-foreground transition-colors" onClick={() => setMobileOpen(false)}>
             <X className="h-5 w-5" />
           </button>
@@ -68,7 +68,7 @@ export default function AdminLayout() {
 
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <header className="h-16 flex items-center justify-between px-6 border-b border-border/40 bg-card/80 backdrop-blur-xl md:hidden z-10 shadow-sm">
-           <div className="font-extrabold text-lg bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">qwen2API</div>
+           <div className="font-extrabold text-lg bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">Web2API</div>
            <button className="text-muted-foreground hover:text-foreground transition-colors" onClick={() => setMobileOpen(true)}>
              <Menu className="h-6 w-6" />
            </button>

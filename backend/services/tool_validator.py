@@ -5,7 +5,7 @@
 import logging
 from typing import Any
 
-log = logging.getLogger("qwen2api.tool_validator")
+log = logging.getLogger("Web2API.tool_validator")
 
 
 def validate_and_fix_tool_call(tool_name: str, tool_input: dict) -> dict:

@@ -14,7 +14,7 @@ from backend.runtime.execution import collect_completion_run, cleanup_runtime_re
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.token_calc import calculate_usage
 
-log = logging.getLogger("qwen2api.gemini")
+log = logging.getLogger("Web2API.gemini")
 router = APIRouter()
 
 GEMINI_STREAM_MEDIA_TYPE = "application/json"

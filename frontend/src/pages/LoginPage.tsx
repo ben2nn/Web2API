@@ -32,7 +32,7 @@ export default function LoginPage() {
       }
 
       const data = await res.json()
-      localStorage.setItem("qwen2api_key", data.token)
+      localStorage.setItem("Web2API_key", data.token)
       toast.success("登录成功")
       navigate("/")
     } catch {
@@ -47,7 +47,7 @@ export default function LoginPage() {
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
           <h1 className="text-3xl font-extrabold bg-gradient-to-br from-indigo-500 to-purple-500 bg-clip-text text-transparent">
-            qwen2API
+            Web2API
           </h1>
           <p className="text-muted-foreground mt-2 text-sm">管理后台登录</p>
         </div>

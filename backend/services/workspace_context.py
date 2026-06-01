@@ -121,7 +121,7 @@ def _normalize_path(path_text: str) -> str:
 
 
 def _default_workspace_root() -> str:
-    configured = os.environ.get("QWEN2API_WORKSPACE_ROOT") or os.environ.get("WORKSPACE_ROOT")
+    configured = os.environ.get("Web2API_WORKSPACE_ROOT") or os.environ.get("WORKSPACE_ROOT")
     if configured:
         return _normalize_path(configured)
     return _normalize_path(str(Path.cwd()))

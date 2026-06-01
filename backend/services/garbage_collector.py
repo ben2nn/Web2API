@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-log = logging.getLogger("qwen2api.gc")
+log = logging.getLogger("Web2API.gc")
 
 
 async def _delete_stale_chat(client, acc, chat_id: str, chat_id_pool) -> None:

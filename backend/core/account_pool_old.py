@@ -6,7 +6,7 @@ from typing import Optional
 from backend.core.database import AsyncJsonDB
 from backend.core.config import settings
 
-log = logging.getLogger("qwen2api.accounts")
+log = logging.getLogger("Web2API.accounts")
 
 
 def _jitter_seconds() -> float:

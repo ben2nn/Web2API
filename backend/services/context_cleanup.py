@@ -5,7 +5,7 @@ import logging
 
 from backend.core.request_logging import request_context
 
-log = logging.getLogger("qwen2api.context_cleanup")
+log = logging.getLogger("Web2API.context_cleanup")
 
 
 async def context_cleanup_loop(app, interval_seconds: int = 300):

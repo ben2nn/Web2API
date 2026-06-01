@@ -27,7 +27,7 @@ from backend.services.task_session import (
 )
 from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
 
-log = logging.getLogger("qwen2api.chat")
+log = logging.getLogger("Web2API.chat")
 router = APIRouter()
 OpenAIDeltaHandler = Callable[[dict[str, Any], str | None, list[dict[str, Any]] | None], Awaitable[None]]
 

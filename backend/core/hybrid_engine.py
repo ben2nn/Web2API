@@ -7,7 +7,7 @@ Phase 1 policy:
 
 import logging
 
-log = logging.getLogger("qwen2api.hybrid_engine")
+log = logging.getLogger("Web2API.hybrid_engine")
 
 
 class HybridEngine:

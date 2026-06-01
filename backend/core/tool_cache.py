@@ -14,7 +14,7 @@ import time
 import logging
 from typing import Dict, Any, Optional, Tuple
 
-log = logging.getLogger("qwen2api.tool_cache")
+log = logging.getLogger("Web2API.tool_cache")
 
 
 class ToolCallCache:

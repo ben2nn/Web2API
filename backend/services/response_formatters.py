@@ -37,7 +37,7 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         for call in oai_tool_calls
     ]
     import logging
-    logging.getLogger("qwen2api.chat").info(
+    logging.getLogger("Web2API.chat").info(
         "[OAI] response finish_reason=%s tool_calls=%s text_preview=%r",
         finish_reason,
         log_payload,

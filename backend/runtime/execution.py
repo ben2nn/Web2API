@@ -35,7 +35,7 @@ _TOXIC_REFUSAL_RE = re.compile(
 )
 
 
-log = logging.getLogger("qwen2api.runtime")
+log = logging.getLogger("Web2API.runtime")
 
 QNML_TOOL_MARKERS = (
     "<|qnml|tool_calls",

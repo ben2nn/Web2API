@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional, List, Dict, Any
 
-log = logging.getLogger("qwen2api.browser_chat")
+log = logging.getLogger("Web2API.browser_chat")
 
 
 @dataclass

@@ -9,7 +9,7 @@ from backend.services.auth_resolver import AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.sse_consumer import parse_sse_chunk
 
-log = logging.getLogger("qwen2api.executor")
+log = logging.getLogger("Web2API.executor")
 
 
 class QwenExecutor:

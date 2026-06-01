@@ -1,4 +1,4 @@
-# qwen2API Enterprise Gateway
+# Web2API Enterprise Gateway
 
 一个功能强大的 Qwen API 网关，支持多种访问方式。
 

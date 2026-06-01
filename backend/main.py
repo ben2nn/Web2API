@@ -27,12 +27,12 @@ from backend.services.garbage_collector import garbage_collect_chats
 from backend.services.context_cleanup import context_cleanup_loop
 
 configure_logging(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
-log = logging.getLogger("qwen2api")
+log = logging.getLogger("Web2API")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with request_context(surface="startup"):
-        log.info("正在启动 qwen2API v2.0 企业网关...")
+        log.info("正在启动 Web2API v2.0 企业网关...")
 
         # 初始化数据存储 (带锁 JSON)
         app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
         await app.state.qwen_client._http_client.aclose()
         log.info("HTTP 连接池已关闭")
 
-app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Web2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,7 +123,7 @@ app.include_router(admin.router, prefix="/api/admin", tags=["Dashboard Admin"])
 @app.get("/api", tags=["System"])
 async def root():
     return {
-        "status": "qwen2API Enterprise Gateway is running",
+        "status": "Web2API Enterprise Gateway is running",
         "docs": "/docs",
         "version": "2.0.0"
     }

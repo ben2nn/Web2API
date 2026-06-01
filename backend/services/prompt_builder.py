@@ -19,7 +19,7 @@ from backend.services.topic_isolation import detect_topic_change
 from backend.services.workspace_context import build_workspace_notice, derive_workspace_root
 from backend.toolcall.formats_qnml import build_qnml_tool_instructions, render_qnml_tool_call
 
-log = logging.getLogger("qwen2api.prompt")
+log = logging.getLogger("Web2API.prompt")
 
 OPENCLAW_STARTUP_PATTERNS = (
     "A new session was started via /new or /reset.",

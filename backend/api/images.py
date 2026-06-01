@@ -16,7 +16,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from backend.services.qwen_client import QwenClient
 
-log = logging.getLogger("qwen2api.images")
+log = logging.getLogger("Web2API.images")
 router = APIRouter()
 
 DEFAULT_IMAGE_MODEL = "qwen3.6-plus"
@@ -98,7 +98,7 @@ def _save_base64_image(data_uri: str) -> str | None:
         raw = base64.b64decode(encoded)
 
         # 保存到临时文件
-        temp_dir = Path(tempfile.gettempdir()) / "qwen2api_images"
+        temp_dir = Path(tempfile.gettempdir()) / "Web2API_images"
         temp_dir.mkdir(exist_ok=True)
         temp_file = temp_dir / f"ref_{int(time.time() * 1000)}{ext}"
         temp_file.write_bytes(raw)

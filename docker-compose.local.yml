@@ -1,6 +1,6 @@
 services:
-  qwen2api:
+  Web2API:
     build:
       context: .
       dockerfile: Dockerfile
-    image: qwen2api:local
+    image: Web2API:local

@@ -11,7 +11,7 @@ from typing import Optional
 from backend.core.account_pool.pool_core import Account, AccountPool as CorePool
 from backend.core.account_pool.pool_acquire import AccountAcquireMixin
 
-log = logging.getLogger("qwen2api.accounts")
+log = logging.getLogger("Web2API.accounts")
 
 
 class AccountPool(AccountAcquireMixin, CorePool):

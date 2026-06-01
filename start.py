@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-qwen2API Enterprise Gateway 启动脚本
+Web2API Enterprise Gateway 启动脚本
 
 前端: Vite dev server  http://localhost:5174  (热更新)
 后端: uvicorn          http://localhost:7860  (API 网关)
@@ -260,7 +260,7 @@ def main():
     browser_auto = os.environ.get("USE_BROWSER_AUTOMATION", "false")
     print()
     print("=" * 50)
-    print("  qwen2API 已上线")
+    print("  Web2API 已上线")
     print(f"  前端 WebUI:   http://127.0.0.1:5174")
     print(f"  后端 API:     http://127.0.0.1:{port}")
     print(f"  venv 环境:    {VENV_DIR}")

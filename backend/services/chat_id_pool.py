@@ -19,7 +19,7 @@ import time
 from collections import deque
 from typing import Any, Optional
 
-log = logging.getLogger("qwen2api.chat_pool")
+log = logging.getLogger("Web2API.chat_pool")
 
 
 class _Entry:

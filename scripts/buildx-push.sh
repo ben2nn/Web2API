@@ -5,11 +5,11 @@ set -euo pipefail
 #   scripts/buildx-push.sh <image[:tag]> [platforms]
 #
 # Example:
-#   scripts/buildx-push.sh myrepo/qwen2api:fix-20260509 linux/amd64,linux/arm64
+#   scripts/buildx-push.sh myrepo/Web2API:fix-20260509 linux/amd64,linux/arm64
 
 IMAGE_TAG="${1:-}"
 PLATFORMS="${2:-linux/amd64,linux/arm64}"
-BUILDER_NAME="${BUILDER_NAME:-qwen2api-multiarch}"
+BUILDER_NAME="${BUILDER_NAME:-Web2API-multiarch}"
 
 if [[ -z "${IMAGE_TAG}" ]]; then
   echo "Usage: $0 <image[:tag]> [platforms]" >&2

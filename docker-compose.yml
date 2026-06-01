@@ -1,7 +1,7 @@
 services:
-  qwen2api:
-    image: ${QWEN2API_IMAGE:-yujunzhixue/qwen2api:latest}
-    container_name: qwen2api
+  Web2API:
+    image: harbor.hrids.com/ai_project/Web2API:latest
+    container_name: Web2API
     restart: unless-stopped
     init: true
     env_file:
@@ -23,6 +23,8 @@ services:
       ACCOUNT_MIN_INTERVAL_MS: "0"
       REQUEST_JITTER_MIN_MS: "0"
       REQUEST_JITTER_MAX_MS: "0"
+      ADMIN_USERNAME: "admin"
+      ADMIN_PASSWORD: "admin123"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/healthz || exit 1"]
       interval: 30s

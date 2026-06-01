@@ -2,7 +2,7 @@
 提示语导致下游 Qwen 拿不到真实文件内容的问题。
 
 Claude Code 的客户端在重复读同一文件时，不重发完整内容，只发一句提示。
-但 qwen2API 每次请求都新建 Qwen chat，Qwen 完全没历史，提示语毫无意义。
+但 Web2API 每次请求都新建 Qwen chat，Qwen 完全没历史，提示语毫无意义。
 本缓存在代理侧保留每个 (api_key, file_path) 最近一次真实 Read 结果，
 prompt_builder 检测到提示语时用缓存回填。
 

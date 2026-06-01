@@ -4,7 +4,7 @@ import uuid
 import logging
 from backend.services.token_calc import count_tokens
 
-log = logging.getLogger("qwen2api.embeddings")
+log = logging.getLogger("Web2API.embeddings")
 router = APIRouter()
 
 @router.post("/embeddings")
