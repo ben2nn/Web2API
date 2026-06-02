@@ -4,14 +4,14 @@
 通过 Camoufox 访问 Qwen 访客模式（/c/guest），
 无需登录、无需 token，直接通过页面交互获取 AI 回复。
 
-支持多页签池，并发请求时使用不同页签。
+支持多页签池、并发控制、重试机制、多轮上下文、工具调用。
 """
 import asyncio
 import logging
 import os
 import time
-from typing import AsyncIterator, Optional
-from dataclasses import dataclass
+from typing import AsyncIterator, Optional, Callable, Awaitable
+from dataclasses import dataclass, field
 
 log = logging.getLogger("web2api.anonymous")
 
@@ -44,16 +44,95 @@ class AnonymousResponse:
     error: str = ""
 
 
-class QwenAnonymousClient:
-    """匿名浏览器聊天客户端 — 单 Camoufox 实例 + 多页签池"""
+def _build_tool_examples(tools: list) -> str:
+    """根据实际工具定义生成 QNML 调用示例，帮助模型正确填充参数值。
 
-    def __init__(self, pool_size: int = TAB_POOL_SIZE):
+    从每个工具的 required 参数中取第一个，构造一个具体的示例调用。
+    """
+    examples = []
+    for tool in tools[:2]:  # 最多取前两个工具
+        func = tool.get("function", {})
+        name = func.get("name", "")
+        if not name:
+            continue
+        params = func.get("parameters", {})
+        required = params.get("required", [])
+        props = params.get("properties", {})
+        if not props:
+            continue
+
+        # 用第一个 required 参数，若无则用第一个 property
+        param_name = required[0] if required else next(iter(props))
+        param_info = props.get(param_name, {})
+        param_desc = param_info.get("description", param_name)
+
+        # 构造一个有意义的示例值（用中文描述，让模型理解要填什么）
+        example_value = f"这里填入{param_desc or param_name}的实际值"
+        if param_info.get("type") == "string":
+            enum_vals = param_info.get("enum", [])
+            if enum_vals:
+                example_value = str(enum_vals[0])
+
+        examples.append(
+            f'<|QNML|invoke name="{name}">\n'
+            f'  <|QNML|parameter name="{param_name}"><![CDATA[{example_value}]]></|QNML|parameter>\n'
+            f'</|QNML|invoke>'
+        )
+
+    if not examples:
+        return ""
+
+    return (
+        "重要规则：调用工具时，必须将用户消息中的实际值填入 <![CDATA[...]]> 中，"
+        "绝对不能留空。示例：\n"
+        + "\n".join(examples)
+    )
+
+
+class QwenAnonymousClient:
+    """匿名浏览器聊天客户端 — 单 Camoufox 实例 + 多页签池
+
+    支持: 并发控制、重试机制、多轮上下文、工具调用、配额管理
+    """
+
+    def __init__(
+        self,
+        pool_size: int = TAB_POOL_SIZE,
+        max_pool_size: int = 10,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+    ):
         self._browser = None
         self._camoufox = None
         self._is_ready = False
         self._pool_size = pool_size
-        self._tab_pool: list = []  # 固定页签列表
-        self._current_idx = 0  # 轮询索引
+        self._max_pool_size = max_pool_size
+        self._tab_pool: list = []
+        self._current_idx = 0
+
+        # 并发控制
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+        # 启动锁：防止并发 start() / close()
+        self._start_lock: Optional[asyncio.Lock] = None
+        # 启动完成事件：让等待方知道 start() 何时结束
+        self._ready_event: Optional[asyncio.Event] = None
+        # 是否正在启动中
+        self._starting: bool = False
+
+        # 重试配置
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
+
+        # 配额统计
+        self._stats = {
+            "total_requests": 0,
+            "success_count": 0,
+            "fail_count": 0,
+            "retry_count": 0,
+            "total_duration": 0.0,
+            "tool_calls_count": 0,
+        }
 
     # ── 生命周期 ──
 
@@ -71,9 +150,32 @@ class QwenAnonymousClient:
             return False
 
     async def _ensure_ready(self) -> bool:
-        """确保浏览器就绪（复用已有实例或重新启动）"""
+        """确保浏览器就绪（复用已有实例或重新启动）
+
+        如果另一个 start() 正在进行中，则等待其完成，而不是杀掉重来。
+        """
+        # 惰性初始化锁和事件（必须在事件循环内创建）
+        if self._start_lock is None:
+            self._start_lock = asyncio.Lock()
+        if self._ready_event is None:
+            self._ready_event = asyncio.Event()
+
+        # 快速路径：已经就绪且存活
         if self._is_ready and await self._check_alive():
             return True
+
+        # 如果另一个 start() 正在进行中，等待它完成
+        if self._starting:
+            log.info("[Anonymous] 另一个启动正在进行中，等待完成...")
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                log.warning("[Anonymous] 等待启动完成超时，尝试重新启动")
+            # 启动完成后检查是否成功
+            if self._is_ready and await self._check_alive():
+                return True
+
+        # 需要重新启动：先关闭旧实例，再启动新的
         await self.close()
         return await self.start()
 
@@ -126,7 +228,7 @@ class QwenAnonymousClient:
             page = await self._create_tab()
             if page:
                 try:
-                    await page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(0.5)
                     await self._dismiss_popup_on_page(page)
                 except Exception as e:
@@ -135,38 +237,81 @@ class QwenAnonymousClient:
         log.info(f"[Anonymous] 页签池预热完成 (可用: {len(self._tab_pool)}/{self._pool_size})")
 
     async def _acquire_tab(self):
-        """轮询获取下一个页签并导航到访客页，页签不可用则重建"""
-        if not self._tab_pool:
+        """获取页签 — 先获取信号量，再从池中取/建页签"""
+        # 获取信号量（控制最大并发数）
+        if self._semaphore:
+            await self._semaphore.acquire()
+
+        try:
+            # 尝试从池中取空闲页签
+            if self._tab_pool:
+                idx = self._current_idx % len(self._tab_pool)
+                self._current_idx = idx + 1
+                page = self._tab_pool[idx]
+
+                # 检查页签是否可用
+                try:
+                    await asyncio.wait_for(page.evaluate("() => true"), timeout=3)
+                except Exception:
+                    log.warning(f"[Anonymous] 页签 {idx} 已失效，重建")
+                    page = await self._create_tab()
+                    if page:
+                        self._tab_pool[idx] = page
+                    else:
+                        # 重建失败，释放信号量
+                        self._semaphore.release()
+                        return None
+
+                # 导航到访客页
+                result = await self._prepare_tab(page, idx)
+                if result is None:
+                    self._semaphore.release()
+                    return None
+                return result
+
+            # 池为空，创建新页签
             log.info("[Anonymous] 页签池为空，创建新页签")
             page = await self._create_tab()
             if not page:
+                self._semaphore.release()
                 return None
             self._tab_pool.append(page)
 
-        # 轮询取下一个页签
-        idx = self._current_idx % len(self._tab_pool)
-        self._current_idx = idx + 1
-        page = self._tab_pool[idx]
-
-        # 检查页签是否仍然可用
-        try:
-            await asyncio.wait_for(page.evaluate("() => true"), timeout=3)
-        except Exception:
-            log.warning(f"[Anonymous] 页签 {idx} 已失效，重建")
-            page = await self._create_tab()
-            if not page:
+            result = await self._prepare_tab(page, 0)
+            if result is None:
+                self._semaphore.release()
                 return None
-            self._tab_pool[idx] = page
+            return result
 
-        # 导航到访客页（失败时重建该页签）
+        except Exception as e:
+            # 任何异常都释放信号量
+            log.error(f"[Anonymous] _acquire_tab 异常: {e}")
+            if self._semaphore:
+                self._semaphore.release()
+            return None
+
+    async def _prepare_tab(self, page, idx: int, max_retries: int = 3):
+        """准备页签：确保页面加载完成并关闭弹窗
+
+        注意：Qwen 的访客模式需要发送消息后才会跳转到 /c/guest，
+        因此此处只确保页面在 BASE_URL 上且可交互，不强制导航到 GUEST_URL。
+        """
         try:
             current_url = page.url
-            is_landing = current_url.rstrip('/') in (BASE_URL, f"{BASE_URL}/")
-            if is_landing or '/c/' not in current_url:
-                log.warning(f"[Anonymous] 页面被重定向到 {current_url}，重试导航")
-                await page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(0.5)
+
+            # 如果页面在空白/about:blank 或非 BASE_URL，导航到 BASE_URL
+            if not current_url.startswith(BASE_URL):
+                log.info(f"[Anonymous] 页面在 {current_url}，导航到首页")
+                await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(1)
                 current_url = page.url
+
+            # 等待输入框就绪（表明页面已可交互）
+            try:
+                await page.wait_for_selector('textarea, [contenteditable="true"]', timeout=15000)
+            except Exception:
+                log.warning(f"[Anonymous] 页签 {idx} 等待输入框超时，继续")
+
             await self._dismiss_popup_on_page(page)
             log.info(f"[Anonymous] 页签已就绪: {current_url} (idx={idx})")
             return page
@@ -181,7 +326,7 @@ class QwenAnonymousClient:
             if new_page:
                 self._tab_pool[idx] = new_page
                 try:
-                    await new_page.goto(GUEST_URL, wait_until="domcontentloaded", timeout=30000)
+                    await new_page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(0.5)
                     await self._dismiss_popup_on_page(new_page)
                     log.info(f"[Anonymous] 页签 {idx} 重建成功")
@@ -190,8 +335,39 @@ class QwenAnonymousClient:
                     log.error(f"[Anonymous] 重建后导航仍失败: {e2}")
             return None
 
+    def _release_tab(self):
+        """释放页签信号量（请求完成后调用）"""
+        if self._semaphore:
+            self._semaphore.release()
+
     async def start(self, retries: int = 3) -> bool:
-        """启动浏览器并预热页签池"""
+        """启动浏览器并预热页签池（带锁，防止并发启动）"""
+        # 惰性初始化
+        if self._start_lock is None:
+            self._start_lock = asyncio.Lock()
+        if self._ready_event is None:
+            self._ready_event = asyncio.Event()
+
+        # 已经在启动中，等待其结果
+        if self._starting:
+            log.info("[Anonymous] start() 被并发调用，等待已有启动完成")
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                log.warning("[Anonymous] 等待并发启动超时")
+            return self._is_ready
+
+        async with self._start_lock:
+            self._starting = True
+            self._ready_event.clear()
+            try:
+                return await self._do_start(retries)
+            finally:
+                self._starting = False
+                self._ready_event.set()
+
+    async def _do_start(self, retries: int = 3) -> bool:
+        """start() 的实际实现（在锁内执行）"""
         for attempt in range(retries):
             try:
                 log.info(f"[Anonymous] 启动 Camoufox... (第 {attempt + 1}/{retries} 次)")
@@ -201,7 +377,9 @@ class QwenAnonymousClient:
                 await self._warm_up_pool()
                 if self._browser and self._browser.is_connected() and self._tab_pool:
                     self._is_ready = True
-                    log.info(f"[Anonymous] ✓ 就绪 (页签: {len(self._tab_pool)}/{self._pool_size})")
+                    # 初始化信号量
+                    self._semaphore = asyncio.Semaphore(self._max_pool_size)
+                    log.info(f"[Anonymous] ✓ 就绪 (页签: {len(self._tab_pool)}/{self._pool_size}, 最大并发: {self._max_pool_size})")
                     return True
                 else:
                     raise Exception("浏览器启动失败")
@@ -215,6 +393,9 @@ class QwenAnonymousClient:
 
     async def close(self):
         """关闭浏览器和所有页签"""
+        if not self._camoufox and not self._tab_pool:
+            return
+
         for page in self._tab_pool:
             try:
                 await page.close()
@@ -229,7 +410,11 @@ class QwenAnonymousClient:
         self._browser = None
         self._camoufox = None
         self._is_ready = False
+        self._semaphore = None
         log.info("[Anonymous] 已关闭")
+
+        # 等待底层 Firefox 进程完全退出，避免新实例启动时冲突
+        await asyncio.sleep(1)
 
     async def _debug_screenshot(self, name: str) -> None:
         """仅在 DEBUG 级别时截图"""
@@ -528,6 +713,179 @@ class QwenAnonymousClient:
         except Exception as e:
             log.error(f"[Anonymous] 设置图片比例失败: {e}")
             return False
+
+    # ── 模型选择 ──
+
+    # 已知模型列表（用于模糊匹配）
+    KNOWN_MODELS = [
+        "Qwen3.7-Plus",
+        "Qwen3.7-Max",
+        "Qwen3.6-Plus",
+        "Qwen3-Plus",
+        "Qwen3-Max",
+        "Qwen3-Coder",
+        "Qwen2.5-Max",
+        "Qwen2.5-Plus",
+        "Qwen-Turbo",
+        "Qwen-Plus",
+        "Qwen-Max",
+    ]
+
+    async def _select_model(self, model_name: str) -> bool:
+        """选择模型
+
+        通过页面顶部的模型选择器下拉菜单切换模型。
+
+        Args:
+            model_name: 模型名称，如 "Qwen3.7-Plus", "Qwen3.7-Max" 等（大小写不敏感）
+        """
+        log.info(f"[Anonymous] 准备选择模型: {model_name}")
+
+        # 等待页面就绪
+        try:
+            await self._page.wait_for_selector('textarea', timeout=10000)
+        except Exception:
+            pass
+
+        # 1. 点击模型选择器触发器（当前模型名称所在的下拉按钮）
+        trigger_clicked = False
+        trigger_selectors = [
+            # 精确匹配：模型选择器容器
+            '.index-module__model-selector___rdCim',
+            '.index-module__model-selector-text___XvWe0',
+            # 通用匹配：ant-dropdown-trigger 内含模型名称的元素
+            '.ant-dropdown-trigger:has(.index-module__model-selector-text)',
+        ]
+        for sel in trigger_selectors:
+            try:
+                trigger = await self._page.wait_for_selector(sel, timeout=5000, state='visible')
+                if trigger:
+                    await trigger.click()
+                    trigger_clicked = True
+                    log.info(f"[Anonymous] 已点击模型选择器: {sel}")
+                    await asyncio.sleep(1)
+                    break
+            except Exception:
+                pass
+
+        # 兜底：查找包含已知模型名称的可点击元素
+        if not trigger_clicked:
+            try:
+                current_model = await self._page.evaluate(r"""() => {
+                    const el = document.querySelector('.index-module__model-selector-text___XvWe0');
+                    return el ? el.textContent.trim() : null;
+                }""")
+                if current_model:
+                    # 如果当前已经是目标模型，直接返回
+                    if current_model.lower() == model_name.lower():
+                        log.info(f"[Anonymous] 当前已是目标模型: {current_model}")
+                        return True
+                    # 点击该元素
+                    selector_text = await self._page.query_selector('.index-module__model-selector-text___XvWe0')
+                    if selector_text and await selector_text.is_visible():
+                        await selector_text.click()
+                        trigger_clicked = True
+                        log.info(f"[Anonymous] 已点击当前模型文本: {current_model}")
+                        await asyncio.sleep(1)
+            except Exception as e:
+                log.debug(f"[Anonymous] 兜底点击模型选择器失败: {e}")
+
+        if not trigger_clicked:
+            # 最终兜底：通过文本匹配查找触发器
+            for model in self.KNOWN_MODELS:
+                try:
+                    el = await self._page.query_selector(f'text="{model}"')
+                    if el and await el.is_visible():
+                        await el.click()
+                        trigger_clicked = True
+                        log.info(f"[Anonymous] 通过文本匹配点击模型选择器: {model}")
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    pass
+
+        if not trigger_clicked:
+            log.warning("[Anonymous] 未找到模型选择器触发器")
+            return False
+
+        # 2. 等待下拉菜单出现
+        await asyncio.sleep(0.5)
+
+        # 3. 查找并点击目标模型
+        model_selected = False
+
+        # 策略 1: 在模型列表项中精确匹配
+        try:
+            items = await self._page.query_selector_all('.index-module__model-item___MkLlj')
+            for item in items:
+                try:
+                    name_el = await item.query_selector('.index-module__model-item-name___X8Hec span:first-child')
+                    if name_el:
+                        text = (await name_el.text_content() or "").strip()
+                        if text.lower() == model_name.lower():
+                            await item.click()
+                            model_selected = True
+                            log.info(f"[Anonymous] 已选择模型（精确匹配）: {text}")
+                            await asyncio.sleep(1)
+                            break
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug(f"[Anonymous] 精确匹配模型失败: {e}")
+
+        # 策略 2: 模糊匹配模型列表项
+        if not model_selected:
+            try:
+                items = await self._page.query_selector_all('.index-module__model-item___MkLlj')
+                for item in items:
+                    try:
+                        text = (await item.text_content() or "").strip()
+                        if model_name.lower() in text.lower():
+                            await item.click()
+                            model_selected = True
+                            log.info(f"[Anonymous] 已选择模型（模糊匹配）: {text}")
+                            await asyncio.sleep(1)
+                            break
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.debug(f"[Anonymous] 模糊匹配模型失败: {e}")
+
+        # 策略 3: 通用文本匹配
+        if not model_selected:
+            try:
+                el = await self._page.query_selector(f'text="{model_name}"')
+                if el and await el.is_visible():
+                    await el.click()
+                    model_selected = True
+                    log.info(f"[Anonymous] 已选择模型（文本匹配）: {model_name}")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
+        if not model_selected:
+            log.warning(f"[Anonymous] 未找到目标模型: {model_name}")
+            # 关闭下拉菜单
+            await self._page.keyboard.press('Escape')
+            return False
+
+        # 4. 验证模型是否切换成功
+        await asyncio.sleep(1)
+        try:
+            current = await self._page.evaluate(r"""() => {
+                const el = document.querySelector('.index-module__model-selector-text___XvWe0');
+                return el ? el.textContent.trim() : null;
+            }""")
+            if current and current.lower() == model_name.lower():
+                log.info(f"[Anonymous] 模型切换成功: {current}")
+                return True
+            elif current:
+                log.warning(f"[Anonymous] 模型可能未切换成功，当前: {current}，目标: {model_name}")
+                return False
+        except Exception:
+            pass
+
+        return model_selected
 
     # ── 文件上传 ──
 
@@ -1437,7 +1795,7 @@ class QwenAnonymousClient:
                 is_gen = await self._is_generating()
 
                 if content and content != last_content:
-                    log.info(f"[Anonymous] [{elapsed:.0f}s] 内容变化: {content[:80]}...")
+                    log.info(f"[Anonymous] [{elapsed:.0f}s] 内容变化: {content}...")
                     last_content = content
                     stable_count = 0
                 elif content and content == last_content:
@@ -1480,6 +1838,15 @@ class QwenAnonymousClient:
         # 验证上传状态
         return await self._verify_upload()
 
+    @staticmethod
+    def _is_retryable(error: str) -> bool:
+        """判断错误是否可重试"""
+        retryable_keywords = [
+            "超时", "timeout", "页签", "失效", "无法获取",
+            "输入失败", "发送失败", "回复超时", "为空",
+        ]
+        return any(kw in error.lower() for kw in retryable_keywords)
+
     async def chat(
         self,
         message: str,
@@ -1487,8 +1854,9 @@ class QwenAnonymousClient:
         mode: str | None = None,
         file_path: str | None = None,
         image_options: dict | None = None,
+        model: str | None = None,
     ) -> AnonymousResponse:
-        """发送消息并等待完整回复
+        """发送消息并等待完整回复（带重试）
 
         Args:
             message: 文本消息
@@ -1496,20 +1864,49 @@ class QwenAnonymousClient:
             mode: "image" 切换到图片生成模式，None 为普通聊天
             file_path: 要上传的文件路径（支持图片、文档等），None 表示不上传
             image_options: 图片选项，包含比例等信息
+            model: 模型名称，如 "Qwen3.7-Plus", "Qwen3.7-Max" 等，None 为当前默认模型
         """
+        start_time = time.time()
+        self._stats["total_requests"] += 1
+
         if not await self._ensure_ready():
+            self._stats["fail_count"] += 1
             return AnonymousResponse(content="", success=False, error="浏览器启动失败")
 
-        # 从池中获取页签
-        page = await self._acquire_tab()
-        if not page:
-            return AnonymousResponse(content="", success=False, error="无法获取页签")
-        self._page = page
+        last_error = ""
+        for attempt in range(self._max_retries + 1):
+            if attempt > 0:
+                delay = self._retry_delay * (2 ** (attempt - 1))
+                log.info(f"[Anonymous] 重试 {attempt}/{self._max_retries}，等待 {delay}s")
+                await asyncio.sleep(delay)
+                self._stats["retry_count"] += 1
 
-        try:
-            return await self._do_chat(message, timeout_sec, mode, file_path, image_options)
-        finally:
-            self._page = None
+            # 从池中获取页签
+            page = await self._acquire_tab()
+            if not page:
+                last_error = "无法获取页签"
+                if not self._is_retryable(last_error):
+                    break
+                continue
+
+            self._page = page
+            try:
+                result = await self._do_chat(message, timeout_sec, mode, file_path, image_options, model)
+                if result.success:
+                    self._stats["success_count"] += 1
+                    self._stats["total_duration"] += time.time() - start_time
+                    return result
+
+                last_error = result.error
+                if not self._is_retryable(last_error):
+                    break
+            finally:
+                self._page = None
+                self._release_tab()
+
+        self._stats["fail_count"] += 1
+        self._stats["total_duration"] += time.time() - start_time
+        return AnonymousResponse(content="", success=False, error=last_error)
 
     async def _do_chat(
         self,
@@ -1517,11 +1914,17 @@ class QwenAnonymousClient:
         timeout_sec: int = 120,
         mode: str | None = None,
         file_path: str | None = None,
-        image_options: dict  | None = None,
+        image_options: dict | None = None,
+        model: str | None = None,
     ) -> AnonymousResponse:
         """chat 核心逻辑（页签已从池中获取）"""
         # 关闭弹窗/遮罩（在输入前）
         await self._dismiss_login_popup()
+
+        # 选择模型
+        if model:
+            if not await self._select_model(model):
+                log.warning(f"[Anonymous] 模型选择失败: {model}，使用当前模型继续")
 
         # 切换模式
         if not await self._ensure_mode(mode, image_options):
@@ -1569,6 +1972,7 @@ class QwenAnonymousClient:
         mode: str | None = None,
         file_path: str | None = None,
         image_options: dict | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[dict]:
         """流式聊天 — yield {"content": str} / {"done": True} / {"error": str}
 
@@ -1578,24 +1982,58 @@ class QwenAnonymousClient:
             mode: "image" 切换到图片生成模式，None 为普通聊天
             file_path: 要上传的文件路径（支持图片、文档等），None 表示不上传
             image_options: 图片选项，包含比例等信息
+            model: 模型名称，如 "Qwen3.7-Plus", "Qwen3.7-Max" 等，None 为当前默认模型
         """
-        log.info(f"[Anonymous] chat_stream 开始 mode={mode} timeout={timeout_sec}s")
+        start_time = time.time()
+        self._stats["total_requests"] += 1
+        log.info(f"[Anonymous] chat_stream 开始 mode={mode} model={model} timeout={timeout_sec}s")
+
         if not await self._ensure_ready():
+            self._stats["fail_count"] += 1
             yield {"error": "浏览器启动失败"}
             return
 
-        # 从池中获取页签
-        page = await self._acquire_tab()
-        if not page:
-            yield {"error": "无法获取页签"}
-            return
-        self._page = page
+        last_error = ""
+        for attempt in range(self._max_retries + 1):
+            if attempt > 0:
+                delay = self._retry_delay * (2 ** (attempt - 1))
+                log.info(f"[Anonymous] 流式重试 {attempt}/{self._max_retries}，等待 {delay}s")
+                await asyncio.sleep(delay)
+                self._stats["retry_count"] += 1
 
-        try:
-            async for chunk in self._do_stream(message, timeout_sec, mode, file_path, image_options):
-                yield chunk
-        finally:
-            self._page = None
+            page = await self._acquire_tab()
+            if not page:
+                last_error = "无法获取页签"
+                if not self._is_retryable(last_error):
+                    break
+                continue
+
+            self._page = page
+            has_error = False
+            try:
+                async for chunk in self._do_stream(message, timeout_sec, mode, file_path, image_options, model):
+                    if "error" in chunk:
+                        has_error = True
+                        last_error = chunk["error"]
+                    yield chunk
+            except Exception as e:
+                has_error = True
+                last_error = str(e)
+                yield {"error": last_error}
+            finally:
+                self._page = None
+                self._release_tab()
+
+            if not has_error:
+                self._stats["success_count"] += 1
+                self._stats["total_duration"] += time.time() - start_time
+                return
+
+            if not self._is_retryable(last_error):
+                break
+
+        self._stats["fail_count"] += 1
+        self._stats["total_duration"] += time.time() - start_time
 
     async def _do_stream(
         self,
@@ -1604,10 +2042,16 @@ class QwenAnonymousClient:
         mode: str | None = None,
         file_path: str | None = None,
         image_options: dict | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[dict]:
         """chat_stream 核心逻辑 — 真流式（页签已从池中获取）"""
         # 关闭弹窗/遮罩（在输入前）
         await self._dismiss_login_popup()
+
+        # 选择模型
+        if model:
+            if not await self._select_model(model):
+                log.warning(f"[Anonymous] 模型选择失败: {model}，使用当前模型继续")
 
         # 切换模式
         if not await self._ensure_mode(mode, image_options):
@@ -1646,6 +2090,307 @@ class QwenAnonymousClient:
         except Exception as e:
             log.error(f"[Anonymous] chat_stream 流式异常: {e}")
             yield {"error": str(e)}
+
+    # ── 多轮上下文 ──
+
+    @staticmethod
+    def _format_messages(messages: list, max_rounds: int = 10) -> str:
+        """将 OpenAI 格式的消息列表格式化为单条 prompt
+
+        Args:
+            messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
+            max_rounds: 保留的最大对话轮数
+        """
+        if not messages:
+            return ""
+
+        parts = []
+
+        # 提取 system prompt
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        if system_msgs:
+            parts.append(f"[系统提示]\n{system_msgs[0]['content']}")
+
+        # 提取对话历史（排除 system）
+        dialog = [m for m in messages if m.get("role") in ("user", "assistant")]
+
+        # 截断：保留最近 max_rounds 轮
+        if len(dialog) > max_rounds * 2:
+            dialog = dialog[-(max_rounds * 2):]
+            parts.append("[以下为截断后的对话历史]")
+
+        # 格式化对话
+        if dialog:
+            history_lines = []
+            for m in dialog[:-1]:  # 除最后一条
+                role = "用户" if m["role"] == "user" else "助手"
+                history_lines.append(f"{role}: {m['content']}")
+            if history_lines:
+                parts.append(f"[对话历史]\n" + "\n".join(history_lines))
+
+            # 最后一条作为当前问题
+            last = dialog[-1]
+            parts.append(f"[当前问题]\n{last['content']}")
+
+        return "\n\n".join(parts)
+
+    async def chat_with_history(
+        self,
+        messages: list,
+        timeout_sec: int = 120,
+        mode: str | None = None,
+        file_path: str | None = None,
+        image_options: dict | None = None,
+        model: str | None = None,
+    ) -> AnonymousResponse:
+        """多轮对话（将历史消息拼接到 prompt）
+
+        Args:
+            messages: OpenAI 格式的消息列表
+            timeout_sec: 超时时间
+            mode: "image" 为图片生成模式
+            file_path: 上传文件路径
+            image_options: 图片选项
+            model: 模型名称
+        """
+        prompt = self._format_messages(messages)
+        return await self.chat(prompt, timeout_sec, mode, file_path, image_options, model)
+
+    async def chat_stream_with_history(
+        self,
+        messages: list,
+        timeout_sec: int = 120,
+        mode: str | None = None,
+        file_path: str | None = None,
+        image_options: dict | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """多轮对话流式版
+
+        Args:
+            messages: OpenAI 格式的消息列表
+            timeout_sec: 超时时间
+            mode: "image" 为图片生成模式
+            file_path: 上传文件路径
+            image_options: 图片选项
+            model: 模型名称
+        """
+        prompt = self._format_messages(messages)
+        async for chunk in self.chat_stream(prompt, timeout_sec, mode, file_path, image_options, model):
+            yield chunk
+
+    # ── 工具调用 ──
+
+    @staticmethod
+    def _build_tool_prompt(tools: list, system_prompt: str = "") -> str:
+        """将 OpenAI 格式的 tools 定义转换为 QNML 工具描述 prompt
+
+        Args:
+            tools: OpenAI 格式的工具定义列表
+            system_prompt: 原始系统提示
+        """
+        import json
+
+        # 生成工具调用示例（放在最前面，确保模型看到）
+        tool_examples = _build_tool_examples(tools)
+
+        try:
+            from backend.toolcall.formats_qnml import build_qnml_tool_instructions
+
+            # 提取工具名称和完整 schema
+            names = []
+            schemas = []
+            for tool in tools:
+                func = tool.get("function", {})
+                name = func.get("name", "")
+                if name:
+                    names.append(name)
+                    # 构建完整的工具 schema 描述
+                    desc = func.get("description", "")
+                    params = func.get("parameters", {})
+                    schema_str = f"{name}: {desc}\nParameters: {json.dumps(params, ensure_ascii=False)}"
+                    schemas.append(schema_str)
+
+            tool_instructions = build_qnml_tool_instructions(names, schemas)
+        except ImportError:
+            # 降级：简单文本描述
+            tool_lines = []
+            for tool in tools:
+                func = tool.get("function", {})
+                tool_lines.append(f"- {func.get('name', '')}: {func.get('description', '')}")
+            tool_instructions = "可用工具:\n" + "\n".join(tool_lines)
+
+        # 将示例插入到工具描述之后、协议说明之前
+        if tool_examples:
+            tool_instructions = tool_examples + "\n\n" + tool_instructions
+
+        if system_prompt:
+            return f"{system_prompt}\n\n{tool_instructions}"
+        return tool_instructions
+
+    @staticmethod
+    def _parse_tool_call(text: str, allowed_names: set[str]) -> list[dict]:
+        """从模型输出中解析 QNML 工具调用
+
+        Args:
+            text: 模型输出文本
+            allowed_names: 允许的工具名称集合
+        """
+        try:
+            from backend.toolcall.formats_qnml import parse_qnml_format
+            return parse_qnml_format(text, allowed_names)
+        except ImportError:
+            log.warning("[Anonymous] QNML 解析器不可用")
+            return []
+
+    @staticmethod
+    def _format_tool_result(tool_calls: list[dict], results: list[dict]) -> str:
+        """将工具执行结果格式化为文本（供模型理解）
+
+        Args:
+            tool_calls: 工具调用列表 [{"name": ..., "input": ...}]
+            results: 工具执行结果列表 [{"result": ...} 或 {"error": ...}]
+        """
+        import json
+
+        lines = []
+        for call, result in zip(tool_calls, results):
+            name = call["name"]
+            args = json.dumps(call.get("input", {}), ensure_ascii=False)
+            if "error" in result:
+                lines.append(f"[工具调用] {name}({args})\n[执行结果] ERROR: {result['error']}")
+            else:
+                output = result.get("result", "")
+                if isinstance(output, (dict, list)):
+                    output = json.dumps(output, ensure_ascii=False)
+                lines.append(f"[工具调用] {name}({args})\n[执行结果] {output}")
+        return "\n\n".join(lines)
+
+    async def chat_with_tools(
+        self,
+        messages: list,
+        tools: list,
+        tool_executor: Callable[[str, dict], Awaitable[dict]],
+        max_rounds: int = 5,
+        timeout_sec: int = 120,
+        model: str | None = None,
+    ) -> AnonymousResponse:
+        """支持工具调用的多轮对话
+
+        Args:
+            messages: OpenAI 格式的消息列表（会原地追加工具调用历史）
+            tools: OpenAI 格式的工具定义列表
+            tool_executor: 工具执行回调 async def(tool_name, arguments) -> dict
+            max_rounds: 最大工具调用轮次
+            timeout_sec: 每轮超时时间
+            model: 模型名称
+
+        Returns:
+            AnonymousResponse，content 为模型最终回答
+        """
+        self._stats["tool_calls_count"] += 1
+
+        # 提取 system prompt 并注入工具描述
+        system_msg = next((m for m in messages if m.get("role") == "system"), None)
+        system_prompt = system_msg["content"] if system_msg else ""
+        tool_prompt = self._build_tool_prompt(tools, system_prompt)
+
+        # 更新 system message
+        if system_msg:
+            system_msg["content"] = tool_prompt
+        else:
+            messages.insert(0, {"role": "system", "content": tool_prompt})
+
+        # 提取允许的工具名称
+        allowed_names = {t["function"]["name"] for t in tools if "function" in t}
+
+        for round_num in range(max_rounds):
+            log.info(f"[Anonymous] ── 工具调用轮次 {round_num + 1}/{max_rounds} ──")
+
+            # 格式化消息为 prompt
+            prompt = self._format_messages(messages)
+            log.info(f"[Anonymous] [Prompt] {prompt}")
+
+            # 调用匿名客户端
+            response = await self.chat(prompt, timeout_sec, model=model)
+
+            if not response.success:
+                log.warning(f"[Anonymous] [Response] 失败: {response.error}")
+                return response
+
+            log.info(f"[Anonymous] [Response] {response.content[:300]}...")
+
+            # 解析工具调用
+            tool_calls = self._parse_tool_call(response.content, allowed_names)
+
+            if not tool_calls:
+                log.info("[Anonymous] [Parse] 无工具调用，返回最终回答")
+                return response
+
+            log.info(f"[Anonymous] [Parse] 解析到 {len(tool_calls)} 个工具调用:")
+            for i, tc in enumerate(tool_calls):
+                log.info(f"  [{i}] {tc['name']}({tc.get('input', {})})")
+
+            # 执行工具
+            log.info(f"[Anonymous] [Execute] 开始执行 {len(tool_calls)} 个工具...")
+            results = []
+            for call in tool_calls:
+                log.info(f"  → 调用 {call['name']}({call.get('input', {})})")
+                try:
+                    result = await tool_executor(call["name"], call.get("input", {}))
+                    # 包装为 {"result": ...} 格式
+                    if isinstance(result, dict) and "error" in result:
+                        results.append(result)
+                        log.warning(f"  ← {call['name']} 错误: {result['error']}")
+                    else:
+                        results.append({"result": result})
+                        log.info(f"  ← {call['name']} 结果: {result}")
+                except Exception as e:
+                    log.error(f"  ← {call['name']} 异常: {e}")
+                    results.append({"error": str(e)})
+
+            # 将工具调用和结果追加到历史
+            messages.append({"role": "assistant", "content": response.content})
+
+            tool_result_text = self._format_tool_result(tool_calls, results)
+            log.info(f"[Anonymous] [ToolResult] {tool_result_text[:300]}...")
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"以下是工具执行结果，请根据结果直接回答用户问题，不要再调用同一工具：\n\n"
+                    f"{tool_result_text}\n\n"
+                    f"请基于以上结果回答用户的问题。"
+                )
+            })
+
+        # 超过最大轮次
+        return AnonymousResponse(
+            content=response.content if response else "",
+            success=False,
+            error=f"超过最大工具调用轮次 ({max_rounds})"
+        )
+
+    # ── 配额管理 ──
+
+    def get_stats(self) -> dict:
+        """获取配额统计信息"""
+        stats = self._stats.copy()
+        stats["avg_duration"] = (
+            stats["total_duration"] / stats["total_requests"]
+            if stats["total_requests"] > 0 else 0.0
+        )
+        return stats
+
+    def reset_stats(self):
+        """重置配额统计"""
+        self._stats = {
+            "total_requests": 0,
+            "success_count": 0,
+            "fail_count": 0,
+            "retry_count": 0,
+            "total_duration": 0.0,
+            "tool_calls_count": 0,
+        }
 
 
 # ── 全局单例 ──

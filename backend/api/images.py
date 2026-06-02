@@ -149,7 +149,8 @@ async def create_image(request: Request):
         if acc is None or chat_id is None:
             raise HTTPException(status_code=500, detail="Image generation session was not created")
 
-        chats = await client.list_chats(acc.token, limit=20)
+        acc_token = acc["token"] if isinstance(acc, dict) else acc.token
+        chats = await client.list_chats(acc_token, limit=20)
         current_chat = next((c for c in chats if isinstance(c, dict) and c.get("id") == chat_id), None)
         answer_text = "\n".join(event_payloads)
         if current_chat:
@@ -170,6 +171,8 @@ async def create_image(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if acc is not None:
-            client.account_pool.release(acc)
+            if not isinstance(acc, dict):
+                client.account_pool.release(acc)
             if chat_id:
-                await client.delete_chat_reliable(acc.token, chat_id, source="image_cleanup")
+                acc_token = acc["token"] if isinstance(acc, dict) else acc.token
+                await client.delete_chat_reliable(acc_token, chat_id, source="image_cleanup")
