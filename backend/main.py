@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import os
 import sys
@@ -128,10 +129,19 @@ async def root():
         "version": "2.0.0"
     }
 
-# 托管前端构建产物
+# 托管前端构建产物 (SPA catch-all)
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    # 静态资源由 StaticFiles 处理（带缓存头）
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """SPA catch-all: 静态文件直接返回，其余路径返回 index.html"""
+        file_path = os.path.join(FRONTEND_DIST, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
 else:
     log.warning(f"未找到前端构建目录: {FRONTEND_DIST}，WebUI 将不可用。")
 
