@@ -20,6 +20,7 @@ legacy/
 
 # Tests and scripts
 test_*.py
+backend/selftests/
 add_account.py
 fix_*.py
 

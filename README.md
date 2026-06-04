@@ -1,19 +1,9 @@
 # Web2API Enterprise Gateway
 
-[![License](https://img.shields.io/github/license/YuJunZhiXue/Web2API?style=flat-square)](https://github.com/YuJunZhiXue/Web2API/blob/main/LICENSE)
-[![Stars](https://img.shields.io/github/stars/YuJunZhiXue/Web2API?style=flat-square)](https://github.com/YuJunZhiXue/Web2API/stargazers)
-[![Forks](https://img.shields.io/github/forks/YuJunZhiXue/Web2API?style=flat-square)](https://github.com/YuJunZhiXue/Web2API/network/members)
-[![Release](https://img.shields.io/github/v/release/YuJunZhiXue/Web2API?style=flat-square)](https://github.com/YuJunZhiXue/Web2API/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/yujunzhixue/Web2API?style=flat-square)](https://hub.docker.com/r/yujunzhixue/Web2API)
+## 加入群聊
 
-[![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/Web2API)
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FYuJunZhiXue%2FWeb2API)
+Telegram 群聊: [https://t.me/qwen2api](https://t.me/qwen2api)
 
-语言 / Language: [中文](./README.md) | [English](./README.en.md)
-
-Web2API 用于将通义千问（chat.qwen.ai）网页版能力转换为 OpenAI、Anthropic Claude 与 Gemini 兼容接口。项目后端基于 FastAPI，前端基于 React + Vite，内置管理台、账号池、工具调用解析、图片生成链路与多种部署方式。
-
----
 [![Stars](https://img.shields.io/github/stars/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/stargazers)
 [![Forks](https://img.shields.io/github/forks/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/network/members)
 [![Release](https://img.shields.io/github/v/release/YuJunZhiXue/qwen2API?style=flat-square)](https://github.com/YuJunZhiXue/qwen2API/releases)

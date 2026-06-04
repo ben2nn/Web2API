@@ -383,7 +383,7 @@ export default function TestPage() {
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([])
   const [loading, setLoading] = useState(false)
   const [model, setModel] = useState("qwen3.6-plus")
-  const [availableModels, setAvailableModels] = useState<ModelOption[]>(FALLBACK_MODELS)
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>(FALLBACK_CHAT_MODELS)
   const [stream, setStream] = useState(true)
   const [typewriter, setTypewriter] = useState(false)
   const [answerMode, setAnswerMode] = useState<"auto" | "thinking" | "fast">("auto")
@@ -407,12 +407,7 @@ export default function TestPage() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`${API_BASE}/v1/models`, { headers: getAuthHeader() })
-        if (!r.ok) return
-        const j = await r.json()
-        const options = (j?.data || [])
-          .map(normalizeModelOption)
-          .filter((item: ModelOption | null): item is ModelOption => Boolean(item?.id))
+        const options = filterTextTestModels(await fetchModelOptions())
         if (options.length) {
           setAvailableModels(options)
           setModel(current => chooseDefaultModel(options, current))
