@@ -3,6 +3,15 @@ import { Button } from "../components/ui/button"
 import { Send, RefreshCw, Bot, X, Wand2, Plus, Paperclip, Microscope, Video, Code, Presentation, Search, Copy, Check } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import {
+  fetchModelOptions,
+  filterTextTestModels,
+  isBaseModelOption,
+  isThinkingVariant,
+  chooseDefaultModel,
+  type ModelOption,
+  type ModelCapability,
+} from "../lib/models"
 import { toast } from "sonner"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -41,33 +50,15 @@ interface ImageGenerationResponse {
   error?: unknown
 }
 
-type ModelCapability = {
-  thinking?: boolean
-  search?: boolean
-  vision?: boolean
-  deep_research?: boolean
-  image_gen?: boolean
-  video_gen?: boolean
-  web_dev?: boolean
-  slides?: boolean
-}
-
-type ModelOption = {
-  id: string
-  base_model?: string
-  family?: string
-  mode?: string
-  display_name?: string
-  capabilities?: ModelCapability
-}
-
 // ─── 工具函数 ───────────────────────────────────────────────────────────────
 
 /** 压缩图片到合理大小，返回 data: URI */
 async function compressImage(file: File, maxDim = 1024, quality = 0.8): Promise<string> {
   return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file)
     const img = new Image()
     img.onload = () => {
+      URL.revokeObjectURL(objectUrl)
       let { width, height } = img
       if (width > maxDim || height > maxDim) {
         const ratio = Math.min(maxDim / width, maxDim / height)
@@ -83,8 +74,11 @@ async function compressImage(file: File, maxDim = 1024, quality = 0.8): Promise<
       const mimeType = file.type === "image/png" ? "image/png" : "image/jpeg"
       resolve(canvas.toDataURL(mimeType, quality))
     }
-    img.onerror = () => reject(new Error("Failed to load image"))
-    img.src = URL.createObjectURL(file)
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error("Failed to load image"))
+    }
+    img.src = objectUrl
   })
 }
 
@@ -104,23 +98,12 @@ function extractImageUrls(content: MessageContent): string[] {
 
 // ─── 模型相关工具函数 ──────────────────────────────────────────────────────
 
-const MODEL_MODE_SUFFIX_RE = /-(thinking|deep-research|deep_research|image|video|webdev|web-dev|slides|t2i|t2v)$/i
-
 function asText(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {}
-}
-
-
-function isBaseModelOption(option: ModelOption): boolean {
-  return option.base_model ? option.id === option.base_model : !MODEL_MODE_SUFFIX_RE.test(option.id)
-}
-
-function isThinkingVariant(modelId: string): boolean {
-  return /-thinking$/i.test(modelId)
 }
 
 function formatModelOption(option: ModelOption): string {
@@ -137,14 +120,6 @@ const FEATURE_MODES: Array<{ mode: InputMode; label: string; icon: typeof Micros
 
 function findModelByCapability(models: ModelOption[], capKey: keyof ModelCapability): ModelOption | undefined {
   return models.find(m => m.capabilities?.[capKey])
-}
-
-function chooseDefaultModel(options: ModelOption[], currentModel?: string): string {
-  if (currentModel && options.some(option => option.id === currentModel)) return currentModel
-  const preferred = options.find(option => option.id === "qwen3.6-plus")
-  if (preferred) return preferred.id
-  const base = options.find(isBaseModelOption)
-  return base?.id || options[0]?.id || "qwen3.6-plus"
 }
 
 
@@ -549,17 +524,26 @@ export default function TestPage() {
   const handleImageGenerate = async (prompt: string) => {
     if (!prompt && attachedImages.length === 0) return
 
-    // 先构建用户消息，立即显示在会话中
+    // 在清空前保存引用
+    const currentImages = [...attachedImages]
+
+    // 预处理所有图片为 base64
+    const processedImages: string[] = []
+    for (const img of currentImages) {
+      const dataUri = img.base64 || await compressImage(img.file)
+      processedImages.push(dataUri)
+    }
+
+    // 构建用户消息，立即显示在会话中
     let userContent: MessageContent = `🎨 生成图片：${prompt || "根据参考图生成"}`
-    if (attachedImages.length > 0) {
+    if (currentImages.length > 0) {
       const parts: ContentPart[] = []
       if (prompt) {
         parts.push({ type: "text", text: `🎨 生成图片：${prompt}` })
       } else {
         parts.push({ type: "text", text: "🎨 根据参考图生成" })
       }
-      for (const img of attachedImages) {
-        const dataUri = img.base64 || await compressImage(img.file)
+      for (const dataUri of processedImages) {
         parts.push({ type: "image_url", image_url: { url: dataUri } })
       }
       userContent = parts
@@ -579,13 +563,8 @@ export default function TestPage() {
         response_format: "url",
       }
 
-      if (attachedImages.length > 0) {
-        const images: string[] = []
-        for (const img of attachedImages) {
-          const dataUri = img.base64 || await compressImage(img.file)
-          images.push(dataUri)
-        }
-        requestBody.images = images
+      if (processedImages.length > 0) {
+        requestBody.images = processedImages
       }
 
       const res = await fetch(`${API_BASE}/v1/images/generations`, {
