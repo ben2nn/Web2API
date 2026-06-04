@@ -40,6 +40,9 @@ export default function TokensPage() {
   }
 
   const handleDelete = (key: string) => {
+    const confirmed = window.confirm(`确定要删除此 API Key 吗？\n\n${key}\n\n此操作不可撤销。`)
+    if (!confirmed) return
+
     fetch(`${API_BASE}/api/admin/keys/${encodeURIComponent(key)}`, {
       method: "DELETE",
       headers: getAuthHeader()

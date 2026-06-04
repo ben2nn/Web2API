@@ -61,9 +61,36 @@ export default function SettingsPage() {
   }, [])
 
   useEffect(() => {
-    fetchSettings()
-    fetchModels()
-  }, [fetchSettings, fetchModels])
+    const controller = new AbortController()
+    const init = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/admin/settings`, {
+          headers: getAuthHeader(),
+          signal: controller.signal,
+        })
+        if (!res.ok) throw new Error("Unauthorized")
+        const data = await res.json()
+        setSettings(data)
+        setMaxInflight(data.max_inflight_per_account || 4)
+        setGlobalMaxInflight(data.global_max_inflight || 0)
+        setPoolTarget(data.chat_id_pool_target || 5)
+        setPoolTtlMin(Math.round((data.chat_id_pool_ttl_seconds || 600) / 60))
+        setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
+      } catch { /* ignore */ }
+
+      setModelsLoading(true)
+      try {
+        const models = await fetchModelOptions()
+        setModels(models)
+      } catch {
+        setModels([])
+      } finally {
+        setModelsLoading(false)
+      }
+    }
+    init()
+    return () => controller.abort()
+  }, [])
 
   const handleSaveSessionKey = () => {
     if (!sessionKey.trim()) {

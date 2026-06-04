@@ -114,20 +114,6 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {}
 }
 
-function normalizeModelOption(value: unknown): ModelOption | null {
-  if (typeof value === "string" && value) return { id: value, capabilities: {} }
-  const record = asRecord(value)
-  const id = asText(record.id)
-  if (!id) return null
-  return {
-    id,
-    base_model: asText(record.base_model) || undefined,
-    family: asText(record.family) || undefined,
-    mode: asText(record.mode) || undefined,
-    display_name: asText(record.display_name) || undefined,
-    capabilities: asRecord(record.capabilities) as ModelCapability,
-  }
-}
 
 function isBaseModelOption(option: ModelOption): boolean {
   return option.base_model ? option.id === option.base_model : !MODEL_MODE_SUFFIX_RE.test(option.id)
@@ -363,7 +349,7 @@ function UserMessageDisplay({ content, onPreview }: { content: MessageContent; o
 
 const TYPEWRITER_CHUNK_SIZE = 2
 const TYPEWRITER_DELAY_MS = 24
-const FALLBACK_MODELS: ModelOption[] = [{ id: "qwen3.6-plus", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "chat", capabilities: {} }]
+const FALLBACK_CHAT_MODELS: ModelOption[] = [{ id: "qwen3.6-plus", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "chat", capabilities: {} }]
 
 const ASPECT_RATIOS = [
   { label: "1:1",  value: "1:1"  },
