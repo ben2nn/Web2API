@@ -74,7 +74,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
-API_KEYS_FILE = DATA_DIR / "api_keys.json"
+API_KEYS_FILE = Path(os.getenv("API_KEYS_FILE", str(DATA_DIR / "api_keys.json")))
 
 def load_api_keys() -> set:
     if API_KEYS_FILE.exists():
@@ -87,14 +87,24 @@ def load_api_keys() -> set:
     return set()
 
 def save_api_keys(keys: set):
+    import logging
+    logger = logging.getLogger("config")
     try:
         API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(API_KEYS_FILE, "w", encoding="utf-8") as f:
+        # 使用临时文件+原子替换，防止写入中途崩溃导致文件损坏
+        tmp_file = API_KEYS_FILE.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump({"keys": list(keys)}, f, indent=2)
+        tmp_file.replace(API_KEYS_FILE)
         return True
+    except PermissionError as e:
+        logger.error(f"保存 API keys 失败（权限不足）: {e}，文件路径: {API_KEYS_FILE}")
+        return False
+    except OSError as e:
+        logger.error(f"保存 API keys 失败（文件系统错误）: {e}，文件路径: {API_KEYS_FILE}")
+        return False
     except Exception as e:
-        import logging
-        logging.getLogger("config").error(f"保存 API keys 失败: {e}")
+        logger.error(f"保存 API keys 失败: {e}")
         return False
 
 # 在内存中存储管理的 API Keys
