@@ -18,6 +18,7 @@ import {
   UploadCloud,
   UserRound,
   XCircle,
+  Lock,
 } from "lucide-react"
 import { toast } from "sonner"
 import { adminRequestErrorMessage, getAuthHeader, getStoredApiKey } from "../lib/auth"
@@ -50,6 +51,8 @@ type AccountItem = {
   gpt_image_quota?: number
   success_count?: number
   failure_count?: number
+  source?: string
+  env_name?: string
 }
 
 type AccountRateLimit = {
@@ -492,18 +495,23 @@ export default function AccountsPage() {
       .catch(err => toast.error(err instanceof Error ? err.message : "\u8d26\u53f7\u6ce8\u5165\u8bf7\u6c42\u5931\u8d25", { id }))
   }
 
-  const handleDelete = (targetEmail: string) => {
+  const handleDelete = (target: AccountItem) => {
     if (!requireSessionKey()) return
-    const id = toast.loading(`\u6b63\u5728\u5220\u9664 ${targetEmail}...`)
-    fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}`, {
+    if (target.source === "env") {
+      toast.error("\u73af\u5883\u53d8\u91cf\u6ce8\u5165\u8d26\u53f7\u4e0d\u80fd\u5728\u9762\u677f\u5220\u9664")
+      return
+    }
+
+    const id = toast.loading(`\u6b63\u5728\u5220\u9664 ${target.email}...`)
+    fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(target.email)}`, {
       method: "DELETE",
       headers: getAuthHeader(),
     }).then(async res => {
       if (!res.ok) throw new Error(await adminRequestErrorMessage(res))
-      toast.success(`\u5df2\u5220\u9664 ${targetEmail}`, { id })
+      toast.success(`\u5df2\u5220\u9664 ${target.email}`, { id })
       setSelected(prev => {
         const next = new Set(prev)
-        next.delete(targetEmail)
+        next.delete(target.email)
         return next
       })
       fetchAccounts()
@@ -512,14 +520,16 @@ export default function AccountsPage() {
 
   const handleDeleteSelected = async () => {
     if (!requireSessionKey()) return
-    if (!selectedAccounts.length) {
+    const deletableAccounts = selectedAccounts.filter(acc => acc.source !== "env")
+    if (!deletableAccounts.length) {
       toast.error("请先选择账号")
       return
     }
-    const id = toast.loading(`正在删除 ${selectedAccounts.length} 个选中账号...`)
+    const skipped = selectedAccounts.length - deletableAccounts.length
+    const id = toast.loading(`正在删除 ${deletableAccounts.length} 个选中账号...`)
     let ok = 0
     let failed = 0
-    for (const acc of selectedAccounts) {
+    for (const acc of deletableAccounts) {
       try {
         const res = await fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(acc.email)}`, {
           method: "DELETE",
@@ -531,7 +541,7 @@ export default function AccountsPage() {
         failed += 1
       }
     }
-    toast.success(`删除完成：成功 ${ok}，失败 ${failed}`, { id, duration: 8000 })
+    toast.success(`删除完成：成功 ${ok}，失败 ${failed}${skipped ? `，跳过环境变量账号 ${skipped}` : ""}`, { id, duration: 8000 })
     setSelected(new Set())
     fetchAccounts()
   }
@@ -980,6 +990,11 @@ export default function AccountsPage() {
                   </td>
                   <td className="px-4 py-4 align-middle">
                     <div className="max-w-[280px] truncate font-mono text-sm text-foreground/90" title={acc.email}>{acc.email}</div>
+                    {acc.source === "env" && (
+                      <div className="mt-1 inline-flex w-fit items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-bold text-emerald-700 dark:text-emerald-300" title={acc.env_name || "环境变量"}>
+                        <Lock className="size-3" /> 环境变量注入
+                      </div>
+                    )}
                     <div className="max-w-[280px] truncate text-xs text-muted-foreground" title={statusNote(acc)}>
                       {acc.username || "所有有效账号均可参与对话、图片和视频生成。"}
                     </div>
@@ -1008,7 +1023,7 @@ export default function AccountsPage() {
                       <IconButton title="刷新 / 验证" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email}>
                         {verifying === acc.email ? <RefreshCw className="size-4 animate-spin" /> : <RotateCw className="size-4" />}
                       </IconButton>
-                      <IconButton title="删除" onClick={() => handleDelete(acc.email)} danger>
+                      <IconButton title={acc.source === "env" ? "环境变量账号需要从环境变量中移除" : "删除"} onClick={() => handleDelete(acc)} disabled={acc.source === "env"} danger>
                         <Trash2 className="size-4" />
                       </IconButton>
                     </div>

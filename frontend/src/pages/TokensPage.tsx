@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Check, Copy, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react"
+import { Check, Copy, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 import { adminRequestErrorMessage, getAuthHeader, getStoredApiKey } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+
+type ApiKeyItem = {
+  key: string
+  source?: "env" | "managed"
+  label?: string
+}
 
 function maskKey(key: string) {
   if (key.length <= 14) return "sk-***"
@@ -11,11 +17,14 @@ function maskKey(key: string) {
 }
 
 export default function TokensPage() {
-  const [keys, setKeys] = useState<string[]>([])
+  const [keys, setKeys] = useState<ApiKeyItem[]>([])
   const [copied, setCopied] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createMode, setCreateMode] = useState<"auto" | "custom">("auto")
+  const [customKey, setCustomKey] = useState("")
 
-  const latestKey = useMemo(() => keys[0] || "", [keys])
+  const latestKey = useMemo(() => keys[0]?.key || "", [keys])
 
   const loadKeys = useCallback(() => {
     if (!getStoredApiKey()) {
@@ -24,18 +33,24 @@ export default function TokensPage() {
       toast.error("请先到「系统设置」粘贴 ADMIN_KEY 或 data/api_keys.json 中已有 API Key")
       return
     }
+    setLoading(true)
     fetch(`${API_BASE}/api/admin/keys`, { headers: getAuthHeader() })
       .then(async res => {
         if (!res.ok) throw new Error(await adminRequestErrorMessage(res))
         return res.json()
       })
-      .then(data => setKeys(data.keys || []))
+      .then(data => {
+        if (Array.isArray(data.items)) {
+          setKeys(data.items)
+          return
+        }
+        setKeys((data.keys || []).map((key: string) => ({ key, source: "managed", label: "面板创建 Key" })))
+      })
       .catch(err => toast.error(err instanceof Error ? err.message : "刷新失败，请检查会话 Key"))
       .finally(() => setLoading(false))
   }, [])
 
   const fetchKeys = useCallback(() => {
-    setLoading(true)
     loadKeys()
   }, [loadKeys])
 
@@ -43,34 +58,55 @@ export default function TokensPage() {
     loadKeys()
   }, [loadKeys])
 
-  const handleGenerate = () => {
+  const copyToClipboard = async (text: string) => {
+    await navigator.clipboard.writeText(text)
+    setCopied(text)
+    window.setTimeout(() => setCopied(null), 1800)
+  }
+
+  const handleCreate = () => {
     if (!getStoredApiKey()) {
       toast.error("请先到「系统设置」粘贴 ADMIN_KEY 或已有 API Key")
       return
     }
-    const id = toast.loading("正在生成新的 API Key...")
+    if (createMode === "custom" && !customKey.trim()) {
+      toast.error("请输入自定义 API Key")
+      return
+    }
+    const id = toast.loading(createMode === "custom" ? "正在添加自定义 API Key..." : "正在生成新的 API Key...")
     fetch(`${API_BASE}/api/admin/keys`, {
       method: "POST",
-      headers: getAuthHeader(),
+      headers: { "Content-Type": "application/json", ...getAuthHeader() },
+      body: JSON.stringify({
+        mode: createMode,
+        key: createMode === "custom" ? customKey.trim() : "",
+      }),
     }).then(async res => {
+      const data = await res.json().catch(() => ({}))
       if (res.ok) {
-        const data = await res.json().catch(() => ({}))
-        toast.success("已生成新的 API Key，并复制到剪贴板", { id })
+        toast.success(createMode === "custom" ? "自定义 API Key 已添加" : "已生成新的 API Key，并复制到剪贴板", { id })
         if (data.key) void copyToClipboard(data.key)
+        setCreateOpen(false)
+        setCustomKey("")
+        setCreateMode("auto")
         fetchKeys()
       } else {
-        toast.error(await adminRequestErrorMessage(res), { id })
+        toast.error(data.detail || data.error || "创建失败，请检查权限", { id })
       }
-    }).catch(() => toast.error("生成失败，请检查权限", { id }))
+    }).catch(() => toast.error("创建失败，请检查权限", { id }))
   }
 
-  const handleDelete = (key: string) => {
+  const handleDelete = (item: ApiKeyItem) => {
     if (!getStoredApiKey()) {
       toast.error("请先到「系统设置」粘贴 ADMIN_KEY 或已有 API Key")
+      return
+    }
+    if (item.source === "env") {
+      toast.error("环境变量注入 Key 不能在面板删除")
       return
     }
     const id = toast.loading("正在删除 API Key...")
-    fetch(`${API_BASE}/api/admin/keys/${encodeURIComponent(key)}`, {
+    fetch(`${API_BASE}/api/admin/keys/${encodeURIComponent(item.key)}`, {
       method: "DELETE",
       headers: getAuthHeader(),
     }).then(async res => {
@@ -81,12 +117,6 @@ export default function TokensPage() {
         toast.error(await adminRequestErrorMessage(res), { id })
       }
     }).catch(() => toast.error("删除失败", { id }))
-  }
-
-  const copyToClipboard = async (text: string) => {
-    await navigator.clipboard.writeText(text)
-    setCopied(text)
-    window.setTimeout(() => setCopied(null), 1800)
   }
 
   return (
@@ -105,8 +135,8 @@ export default function TokensPage() {
             <Button variant="outline" onClick={() => { fetchKeys(); toast.success("已刷新") }} disabled={loading}>
               <RefreshCw className={`mr-2 size-4 ${loading ? "animate-spin" : ""}`} /> 刷新
             </Button>
-            <Button onClick={handleGenerate}>
-              <Plus className="mr-2 size-4" /> 生成新 Key
+            <Button onClick={() => setCreateOpen(true)}>
+              <Plus className="mr-2 size-4" /> 创建 Key
             </Button>
           </div>
         </div>
@@ -134,7 +164,7 @@ export default function TokensPage() {
         <div className="flex items-center justify-between border-b border-border/50 bg-muted/10 px-6 py-5">
           <div>
             <h3 className="text-xl font-black tracking-tight">Key 列表</h3>
-            <p className="text-sm text-muted-foreground">Key 默认遮蔽展示，复制时会写入完整值。</p>
+            <p className="text-sm text-muted-foreground">Key 默认遮蔽展示，复制时会写入完整值；环境变量注入 Key 需要从环境变量移除。</p>
           </div>
           <KeyRound className="size-8 text-muted-foreground/30" />
         </div>
@@ -144,23 +174,35 @@ export default function TokensPage() {
               <div>
                 <KeyRound className="mx-auto mb-4 size-12 opacity-30" />
                 <div className="font-semibold text-foreground">暂无 API Key</div>
-                <p className="mt-1 text-sm">点击“生成新 Key”创建下游访问凭证。</p>
+                <p className="mt-1 text-sm">点击“创建 Key”创建下游访问凭证，或通过环境变量注入。</p>
               </div>
             </div>
           ) : (
-            keys.map((key, index) => (
-              <div key={key} className="grid gap-4 px-6 py-5 lg:grid-cols-[auto_1fr_auto] lg:items-center">
+            keys.map((item, index) => (
+              <div key={item.key} className="grid gap-4 px-6 py-5 lg:grid-cols-[auto_1fr_auto] lg:items-center">
                 <div className="grid size-10 place-items-center rounded-2xl bg-muted font-mono text-sm font-black">{index + 1}</div>
                 <div className="min-w-0">
-                  <div className="truncate font-mono text-sm font-bold">{maskKey(key)}</div>
-                  <div className="mt-1 text-xs text-muted-foreground">完整 Key 不直接明文展示，避免旁观泄露。</div>
+                  <div className="truncate font-mono text-sm font-bold">{maskKey(item.key)}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span>完整 Key 不直接明文展示，避免旁观泄露。</span>
+                    <span className={`rounded-full border px-2 py-0.5 font-bold ${item.source === "env" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "bg-muted text-muted-foreground"}`}>
+                      {item.label || (item.source === "env" ? "环境变量注入 Key" : "面板创建 Key")}
+                    </span>
+                  </div>
                 </div>
                 <div className="flex justify-end gap-2">
-                  <Button variant="secondary" size="sm" onClick={() => void copyToClipboard(key)}>
-                    {copied === key ? <Check className="mr-2 size-4 text-emerald-600" /> : <Copy className="mr-2 size-4" />}
+                  <Button variant="secondary" size="sm" onClick={() => void copyToClipboard(item.key)}>
+                    {copied === item.key ? <Check className="mr-2 size-4 text-emerald-600" /> : <Copy className="mr-2 size-4" />}
                     复制
                   </Button>
-                  <Button variant="ghost" size="sm" onClick={() => handleDelete(key)} className="text-destructive hover:bg-destructive/10 hover:text-destructive">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleDelete(item)}
+                    disabled={item.source === "env"}
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    title={item.source === "env" ? "环境变量 Key 需要从环境变量中移除" : "删除"}
+                  >
                     <Trash2 className="size-4" />
                   </Button>
                 </div>
@@ -169,6 +211,60 @@ export default function TokensPage() {
           )}
         </div>
       </section>
+
+      {createOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-[28px] border border-white/75 bg-card p-5 shadow-[var(--shadow-lift)]">
+            <div className="flex items-center justify-between border-b border-border/50 pb-4">
+              <div className="flex items-center gap-2">
+                <KeyRound className="size-5 text-primary" />
+                <h3 className="text-lg font-black">创建 API Key</h3>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => setCreateOpen(false)} title="关闭">
+                <X className="size-4" />
+              </Button>
+            </div>
+            <div className="space-y-4 pt-4">
+              <div className="grid grid-cols-2 rounded-2xl border bg-muted/30 p-1">
+                <button
+                  type="button"
+                  onClick={() => setCreateMode("auto")}
+                  className={`rounded-xl px-3 py-2 text-sm font-bold ${createMode === "auto" ? "bg-background shadow-sm" : "text-muted-foreground"}`}
+                >
+                  自动生成
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateMode("custom")}
+                  className={`rounded-xl px-3 py-2 text-sm font-bold ${createMode === "custom" ? "bg-background shadow-sm" : "text-muted-foreground"}`}
+                >
+                  自定义 Key
+                </button>
+              </div>
+
+              {createMode === "custom" && (
+                <div className="space-y-2">
+                  <label className="text-sm font-bold">API Key</label>
+                  <input
+                    type="text"
+                    value={customKey}
+                    onChange={e => setCustomKey(e.target.value)}
+                    placeholder="sk-your-custom-key"
+                    className="flex h-11 w-full rounded-2xl border border-input bg-background px-3 py-2 font-mono text-sm"
+                  />
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <Button variant="outline" onClick={() => setCreateOpen(false)}>取消</Button>
+                <Button onClick={handleCreate}>
+                  <Plus className="mr-2 size-4" /> 创建
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -1,6 +1,5 @@
 package main
 
-// Reference source: backend/main.py.
 // Go runtime entrypoint for the migrated backend.
 
 import (
@@ -47,20 +46,24 @@ import (
 
 // ---- migrated from main.go ----
 type App struct {
-	settings Settings
-	logger   *slog.Logger
-	accounts *AccountPool
-	client   *QwenClient
-	chatPool *ChatIDPool
-	apiKeys  map[string]bool
+	settings       Settings
+	logger         *slog.Logger
+	accounts       *AccountPool
+	client         *QwenClient
+	chatPool       *ChatIDPool
+	apiKeys        map[string]bool
+	managedAPIKeys map[string]bool
+	envAPIKeys     map[string]bool
 
 	usersStore        *JSONStore
 	accountsStore     *JSONStore
 	capturesStore     *JSONStore
+	configStore       *JSONStore
 	contextCacheStore *JSONStore
 	uploadedFileStore *JSONStore
 	sessionStore      *JSONStore
 	fileContentCache  *fileContentCache
+	keepalive         *KeepAliveService
 }
 
 func main() {
@@ -151,19 +154,21 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		usersStore:        NewJSONStore(settings.UsersFile, []any{}),
 		accountsStore:     NewJSONStore(settings.AccountsFile, []any{}),
 		capturesStore:     NewJSONStore(settings.CapturesFile, []any{}),
+		configStore:       NewJSONStore(settings.ConfigFile, map[string]any{}),
 		contextCacheStore: NewJSONStore(settings.ContextCacheFile, []any{}),
 		uploadedFileStore: NewJSONStore(settings.UploadedFilesFile, []any{}),
 		sessionStore:      NewJSONStore(settings.ContextAffinityFile, []any{}),
 		fileContentCache:  newFileContentCache(),
 	}
 
-	app.apiKeys = loadAPIKeys(settings.APIKeysFile, logger)
+	app.apiKeys, app.managedAPIKeys, app.envAPIKeys = loadAPIKeys(settings.APIKeysFile, logger)
 	app.accounts = NewAccountPool(app.accountsStore, settings, logger)
 	if err := app.accounts.Load(); err != nil {
 		return nil, err
 	}
 	app.client = NewQwenClient(app.accounts, settings, logger)
 	app.chatPool = NewChatIDPool(app.client, app.accounts, settings, logger)
+	app.keepalive = NewKeepAliveService(logger)
 	return app, nil
 }
 
@@ -172,6 +177,9 @@ func (app *App) StartBackground(ctx context.Context) {
 		return
 	}
 	app.chatPool.Start(ctx)
+	if app.keepalive != nil {
+		app.keepalive.Start(ctx, app.keepaliveConfig())
+	}
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -247,6 +255,8 @@ type Account struct {
 	Token               string  `json:"token"`
 	Cookies             string  `json:"cookies"`
 	Username            string  `json:"username"`
+	Source              string  `json:"source,omitempty"`
+	EnvName             string  `json:"env_name,omitempty"`
 	ActivationPending   bool    `json:"activation_pending"`
 	StatusCode          string  `json:"status_code"`
 	LastError           string  `json:"last_error"`
@@ -316,6 +326,23 @@ func (p *AccountPool) Load() error {
 		data[i].migrateLegacyRateLimit(p.settings)
 		p.accounts = append(p.accounts, &data[i])
 	}
+	for _, envAcc := range loadEnvAccounts() {
+		envAcc.normalize()
+		envAcc.migrateLegacyRateLimit(p.settings)
+		replaced := false
+		for i, existing := range p.accounts {
+			if existing.Email == envAcc.Email && envAcc.Email != "" {
+				cp := envAcc
+				p.accounts[i] = &cp
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			cp := envAcc
+			p.accounts = append(p.accounts, &cp)
+		}
+	}
 	p.resetLocked()
 	p.logger.Info("loaded upstream accounts", "count", len(p.accounts))
 	return nil
@@ -325,6 +352,9 @@ func (p *AccountPool) Save() error {
 	p.mu.Lock()
 	data := make([]Account, 0, len(p.accounts))
 	for _, acc := range p.accounts {
+		if acc.Source == "env" {
+			continue
+		}
 		cp := *acc
 		cp.Valid = false
 		cp.Inflight = 0
@@ -446,6 +476,12 @@ func (p *AccountPool) Add(acc Account) error {
 
 func (p *AccountPool) Remove(email string) error {
 	p.mu.Lock()
+	for _, acc := range p.accounts {
+		if acc.Email == email && acc.Source == "env" {
+			p.mu.Unlock()
+			return errors.New("environment account cannot be deleted from admin panel")
+		}
+	}
 	next := p.accounts[:0]
 	for _, acc := range p.accounts {
 		if acc.Email != email {
@@ -644,6 +680,9 @@ func (p *AccountPool) MarkVerification(email string, result TokenVerifyResult) e
 }
 
 func (a *Account) normalize() {
+	if strings.TrimSpace(a.Source) == "" {
+		a.Source = "file"
+	}
 	if a.StatusCode == "" {
 		if a.ActivationPending {
 			a.StatusCode = "pending_activation"
@@ -1715,8 +1754,16 @@ func warmChatKey(email, model, chatType string) string {
 
 // ---- migrated from config.go ----
 const (
-	Version                 = "2.0.0-go"
-	openAIModelCreatedEpoch = int64(1700000000)
+	Version                  = "2.0.0-go"
+	openAIModelCreatedEpoch  = int64(1700000000)
+	keepAliveMinInterval     = 5
+	keepAliveMaxInterval     = 86400
+	keepAliveDefaultInterval = 60
+)
+
+var (
+	numberedAPIKeyEnvRe  = regexp.MustCompile(`^QWEN_API_KEY_(\d+)$`)
+	numberedAccountEnvRe = regexp.MustCompile(`^QWEN_ACCOUNT_(\d+)$`)
 )
 
 type Settings struct {
@@ -1745,6 +1792,8 @@ type Settings struct {
 	TraceResponseFingerprints              bool
 	TraceResponseTailChars                 int
 	LogLevel                               string
+	KeepAliveURL                           string
+	KeepAliveInterval                      int
 
 	BaseDir                          string
 	DataDir                          string
@@ -1803,6 +1852,8 @@ func LoadSettings() Settings {
 		TraceResponseFingerprints:              envBool("TRACE_RESPONSE_FINGERPRINTS", false),
 		TraceResponseTailChars:                 envInt("TRACE_RESPONSE_TAIL_CHARS", 160),
 		LogLevel:                               envString("LOG_LEVEL", "INFO"),
+		KeepAliveURL:                           envString("KEEPALIVE_URL", ""),
+		KeepAliveInterval:                      clampInt(envInt("KEEPALIVE_INTERVAL", keepAliveDefaultInterval), keepAliveMinInterval, keepAliveMaxInterval),
 		BaseDir:                                base,
 		DataDir:                                data,
 		LogsDir:                                logs,
@@ -1912,22 +1963,57 @@ func modelModeSuffixes() []string {
 	return []string{"-deep-research", "-deep_research", "-web-dev", "-thinking", "-search", "-webdev", "-image", "-video", "-slides", "-t2i", "-t2v"}
 }
 
-func loadAPIKeys(path string, logger *slog.Logger) map[string]bool {
+func loadAPIKeys(path string, logger *slog.Logger) (map[string]bool, map[string]bool, map[string]bool) {
+	managed := loadManagedAPIKeys(path, logger)
+	envKeys := loadEnvAPIKeys()
+	all := map[string]bool{}
+	for key := range managed {
+		all[key] = true
+	}
+	for key := range envKeys {
+		all[key] = true
+	}
+	return all, managed, envKeys
+}
+
+func loadManagedAPIKeys(path string, logger *slog.Logger) map[string]bool {
 	keys := map[string]bool{}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return keys
 	}
 	var payload struct {
-		Keys []string `json:"keys"`
+		Keys any `json:"keys"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		logger.Warn("failed to parse api_keys.json", "error", err)
 		return keys
 	}
-	for _, k := range payload.Keys {
-		if strings.TrimSpace(k) != "" {
-			keys[k] = true
+	switch v := payload.Keys.(type) {
+	case []any:
+		for _, item := range v {
+			if key := strings.TrimSpace(fmt.Sprint(item)); key != "" {
+				keys[key] = true
+			}
+		}
+	case string:
+		for _, key := range splitEnvList(v) {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+func loadEnvAPIKeys() map[string]bool {
+	keys := map[string]bool{}
+	for _, name := range []string{"QWEN_API_KEY", "QWEN_API_KEYS", "API_KEYS"} {
+		for _, key := range splitEnvList(os.Getenv(name)) {
+			keys[key] = true
+		}
+	}
+	for _, item := range numberedEnvValues(numberedAPIKeyEnvRe) {
+		for _, key := range splitEnvList(item.value) {
+			keys[key] = true
 		}
 	}
 	return keys
@@ -1938,7 +2024,90 @@ func saveAPIKeys(path string, keys map[string]bool) error {
 	for k := range keys {
 		list = append(list, k)
 	}
+	sort.Strings(list)
 	return writeJSONFile(path, map[string]any{"keys": list})
+}
+
+type numberedEnvValue struct {
+	index int
+	name  string
+	value string
+}
+
+func numberedEnvValues(pattern *regexp.Regexp) []numberedEnvValue {
+	items := []numberedEnvValue{}
+	for _, env := range os.Environ() {
+		name, value, ok := strings.Cut(env, "=")
+		if !ok {
+			continue
+		}
+		match := pattern.FindStringSubmatch(name)
+		if len(match) != 2 {
+			continue
+		}
+		index, _ := strconv.Atoi(match[1])
+		items = append(items, numberedEnvValue{index: index, name: name, value: value})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].index != items[j].index {
+			return items[i].index < items[j].index
+		}
+		return items[i].name < items[j].name
+	})
+	return items
+}
+
+func splitEnvList(value string) []string {
+	parts := regexp.MustCompile(`[,\s;]+`).Split(value, -1)
+	out := []string{}
+	seen := map[string]bool{}
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
+}
+
+func loadEnvAccounts() []Account {
+	accounts := []Account{}
+	for _, item := range numberedEnvValues(numberedAccountEnvRe) {
+		parts := strings.SplitN(item.value, ";", 3)
+		token := strings.TrimSpace(parts[0])
+		if token == "" {
+			continue
+		}
+		email := fmt.Sprintf("env_%d@qwen", item.index)
+		if len(parts) >= 2 && strings.TrimSpace(parts[1]) != "" {
+			email = strings.TrimSpace(parts[1])
+		}
+		password := ""
+		if len(parts) >= 3 {
+			password = strings.TrimSpace(parts[2])
+		}
+		accounts = append(accounts, Account{
+			Email:      email,
+			Password:   password,
+			Token:      token,
+			Source:     "env",
+			EnvName:    item.name,
+			StatusCode: "valid",
+		})
+	}
+	return accounts
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func envString(key, fallback string) string {
@@ -1987,6 +2156,224 @@ func envBool(key string, fallback bool) bool {
 	return fallback
 }
 
+type KeepAliveConfig struct {
+	URL       string
+	Interval  int
+	EnvLocked []string
+}
+
+type KeepAliveService struct {
+	logger *slog.Logger
+
+	mu             sync.Mutex
+	parent         context.Context
+	cancel         context.CancelFunc
+	running        bool
+	url            string
+	interval       int
+	lastStatusCode int
+	lastError      string
+	lastChecked    float64
+}
+
+func NewKeepAliveService(logger *slog.Logger) *KeepAliveService {
+	return &KeepAliveService{logger: logger}
+}
+
+func (s *KeepAliveService) Start(parent context.Context, cfg KeepAliveConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.parent = parent
+	s.mu.Unlock()
+	s.Apply(cfg)
+}
+
+func (s *KeepAliveService) Apply(cfg KeepAliveConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	parent := s.parent
+	if parent == nil {
+		parent = context.Background()
+	}
+	cfg.URL = strings.TrimSpace(cfg.URL)
+	cfg.Interval = clampInt(cfg.Interval, keepAliveMinInterval, keepAliveMaxInterval)
+	s.url = cfg.URL
+	s.interval = cfg.Interval
+	s.lastError = ""
+	s.lastStatusCode = 0
+	s.lastChecked = 0
+	if cfg.URL == "" {
+		s.running = false
+		s.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.cancel = cancel
+	s.running = true
+	url := cfg.URL
+	interval := cfg.Interval
+	s.mu.Unlock()
+
+	go s.run(ctx, url, interval)
+}
+
+func (s *KeepAliveService) Stop() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.running = false
+	s.mu.Unlock()
+}
+
+func (s *KeepAliveService) run(ctx context.Context, target string, interval int) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+	for {
+		s.ping(ctx, client, target)
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			if s.url == target {
+				s.running = false
+			}
+			s.mu.Unlock()
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *KeepAliveService) ping(ctx context.Context, client *http.Client, target string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		s.record(0, err)
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			s.record(0, err)
+		}
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	s.record(resp.StatusCode, nil)
+}
+
+func (s *KeepAliveService) record(status int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastStatusCode = status
+	s.lastChecked = float64(time.Now().UnixNano()) / 1e9
+	if err != nil {
+		s.lastError = err.Error()
+		if s.logger != nil {
+			s.logger.Warn("keepalive request failed", "error", err)
+		}
+		return
+	}
+	s.lastError = ""
+	if s.logger != nil {
+		s.logger.Debug("keepalive request completed", "status", status)
+	}
+}
+
+func (s *KeepAliveService) Status() map[string]any {
+	if s == nil {
+		return map[string]any{"running": false}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"running":          s.running,
+		"url":              s.url,
+		"interval":         s.interval,
+		"last_status_code": s.lastStatusCode,
+		"last_error":       s.lastError,
+		"last_checked":     s.lastChecked,
+	}
+}
+
+func (app *App) keepaliveConfig() KeepAliveConfig {
+	cfg := KeepAliveConfig{URL: app.settings.KeepAliveURL, Interval: app.settings.KeepAliveInterval}
+	if cfg.Interval <= 0 {
+		cfg.Interval = keepAliveDefaultInterval
+	}
+	var data map[string]any
+	if app.configStore != nil {
+		_ = app.configStore.LoadInto(&data)
+	}
+	if cfg.URL == "" && data != nil {
+		cfg.URL = stringValue(data, "keepalive_url", "")
+	}
+	if data != nil {
+		cfg.Interval = clampInt(intValue(data, "keepalive_interval", cfg.Interval), keepAliveMinInterval, keepAliveMaxInterval)
+	}
+	locked := []string{}
+	if v, ok := os.LookupEnv("KEEPALIVE_URL"); ok {
+		cfg.URL = strings.TrimSpace(v)
+		locked = append(locked, "keepalive_url")
+	}
+	if v, ok := os.LookupEnv("KEEPALIVE_INTERVAL"); ok {
+		if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.Interval = clampInt(i, keepAliveMinInterval, keepAliveMaxInterval)
+		}
+		locked = append(locked, "keepalive_interval")
+	}
+	cfg.EnvLocked = locked
+	return cfg
+}
+
+func (app *App) updateKeepAliveSettings(body map[string]any) error {
+	if _, hasURL := body["keepalive_url"]; !hasURL {
+		if _, hasInterval := body["keepalive_interval"]; !hasInterval {
+			return nil
+		}
+	}
+	data := map[string]any{}
+	if app.configStore != nil {
+		_ = app.configStore.LoadInto(&data)
+	}
+	locked := map[string]bool{}
+	for _, key := range app.keepaliveConfig().EnvLocked {
+		locked[key] = true
+	}
+	if _, ok := body["keepalive_url"]; ok && !locked["keepalive_url"] {
+		data["keepalive_url"] = stringValue(body, "keepalive_url", "")
+	}
+	if _, ok := body["keepalive_interval"]; ok && !locked["keepalive_interval"] {
+		interval := intValue(body, "keepalive_interval", keepAliveDefaultInterval)
+		if interval < keepAliveMinInterval || interval > keepAliveMaxInterval {
+			return fmt.Errorf("保活间隔必须在 %d - %d 秒之间", keepAliveMinInterval, keepAliveMaxInterval)
+		}
+		data["keepalive_interval"] = interval
+	}
+	if app.configStore != nil {
+		if err := app.configStore.Save(data); err != nil {
+			return err
+		}
+	}
+	if app.keepalive != nil {
+		app.keepalive.Apply(app.keepaliveConfig())
+	}
+	return nil
+}
+
 // ---- migrated from handlers.go ----
 type AuthContext struct {
 	Token string
@@ -1999,6 +2386,8 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("GET /api", app.handleAPI)
 	mux.HandleFunc("GET /healthz", app.handleHealth)
 	mux.HandleFunc("GET /readyz", app.handleReady)
+	mux.HandleFunc("GET /keepalive", app.handleKeepAlive)
+	mux.HandleFunc("HEAD /keepalive", app.handleKeepAlive)
 
 	mux.HandleFunc("POST /v1/chat/completions", app.handleChatCompletions)
 	mux.HandleFunc("POST /chat/completions", app.handleChatCompletions)
@@ -2084,6 +2473,14 @@ func (app *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (app *App) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "accounts": app.accounts.Status()})
+}
+
+func (app *App) handleKeepAlive(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": Version})
 }
 
 func (app *App) handleSPA(w http.ResponseWriter, r *http.Request) {
@@ -5820,6 +6217,7 @@ func (app *App) adminListAccounts(w http.ResponseWriter, r *http.Request) {
 		accounts = append(accounts, map[string]any{
 			"email": acc.Email, "password": acc.Password, "token": acc.Token, "cookies": acc.Cookies,
 			"username": acc.Username, "activation_pending": acc.ActivationPending, "status_code": acc.StatusCode,
+			"source": acc.Source, "env_name": acc.EnvName,
 			"last_error": acc.LastError, "last_request_started": acc.LastRequestStarted, "last_request_finished": acc.LastRequestFinished,
 			"consecutive_failures": acc.ConsecutiveFailures, "rate_limit_strikes": acc.RateLimitStrikes,
 			"valid": acc.Valid, "inflight": acc.Inflight, "rate_limited_until": acc.RateLimitedUntil,
@@ -5957,6 +6355,10 @@ func (app *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := app.accounts.Remove(r.PathValue("email")); err != nil {
+		if strings.Contains(err.Error(), "environment account") {
+			writeError(w, http.StatusBadRequest, "环境变量注入账号不能在面板删除，请移除对应环境变量后重启服务")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -5966,6 +6368,11 @@ func (app *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 	if _, ok := app.verifyAdmin(w, r); !ok {
 		return
+	}
+	keepaliveCfg := app.keepaliveConfig()
+	keepaliveStatus := map[string]any{"running": false}
+	if app.keepalive != nil {
+		keepaliveStatus = app.keepalive.Status()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":                      Version,
@@ -5977,6 +6384,11 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 		"chat_id_pool_target":          app.settings.ChatIDPrewarmTargetPerAccount,
 		"chat_id_pool_ttl_seconds":     app.settings.ChatIDPrewarmTTLSeconds,
 		"chat_id_pool_max_concurrency": app.settings.ChatIDPrewarmMaxConcurrency,
+		"keepalive_url":                keepaliveCfg.URL,
+		"keepalive_interval":           keepaliveCfg.Interval,
+		"keepalive_env_locked":         keepaliveCfg.EnvLocked,
+		"keepalive_running":            boolValue(keepaliveStatus["running"]),
+		"keepalive_status":             keepaliveStatus,
 		"model_aliases":                modelMap,
 	})
 }
@@ -6010,6 +6422,10 @@ func (app *App) adminUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if _, ok := body["chat_id_pool_max_concurrency"]; ok {
 		app.settings.ChatIDPrewarmMaxConcurrency = max(1, intValue(body, "chat_id_pool_max_concurrency", app.settings.ChatIDPrewarmMaxConcurrency))
 	}
+	if err := app.updateKeepAliveSettings(body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if app.chatPool != nil {
 		app.chatPool.UpdateSettings(app.settings)
 		if app.settings.ChatIDPrewarmTargetPerAccount > 0 {
@@ -6035,21 +6451,65 @@ func (app *App) adminGetKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := []string{}
+	items := []map[string]any{}
 	for key := range app.apiKeys {
 		keys = append(keys, key)
+		source := "managed"
+		label := "面板创建 Key"
+		if app.envAPIKeys[key] {
+			source = "env"
+			label = "环境变量注入 Key"
+		}
+		items = append(items, map[string]any{"key": key, "source": source, "label": label})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+	sort.Strings(keys)
+	sort.Slice(items, func(i, j int) bool {
+		return fmt.Sprint(items[i]["key"]) < fmt.Sprint(items[j]["key"])
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys, "items": items})
 }
 
 func (app *App) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 	if _, ok := app.verifyAdmin(w, r); !ok {
 		return
 	}
-	buf := make([]byte, 24)
-	_, _ = cryptorand.Read(buf)
-	key := "sk-" + hex.EncodeToString(buf)
+	var body struct {
+		Mode string `json:"mode"`
+		Key  string `json:"key"`
+	}
+	raw, _ := io.ReadAll(r.Body)
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+	}
+	mode := normalizeLower(body.Mode)
+	if mode == "" {
+		mode = "auto"
+	}
+	key := strings.TrimSpace(body.Key)
+	if mode == "custom" {
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "自定义 Key 不能为空")
+			return
+		}
+		if strings.ContainsAny(key, " \t\r\n") {
+			writeError(w, http.StatusBadRequest, "自定义 Key 不能包含空白字符")
+			return
+		}
+	} else {
+		buf := make([]byte, 24)
+		_, _ = cryptorand.Read(buf)
+		key = "sk-" + hex.EncodeToString(buf)
+	}
+	if app.apiKeys[key] {
+		writeError(w, http.StatusConflict, "API Key 已存在")
+		return
+	}
 	app.apiKeys[key] = true
-	_ = saveAPIKeys(app.settings.APIKeysFile, app.apiKeys)
+	app.managedAPIKeys[key] = true
+	_ = saveAPIKeys(app.settings.APIKeysFile, app.managedAPIKeys)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": key})
 }
 
@@ -6057,8 +6517,14 @@ func (app *App) adminDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if _, ok := app.verifyAdmin(w, r); !ok {
 		return
 	}
-	delete(app.apiKeys, r.PathValue("key"))
-	_ = saveAPIKeys(app.settings.APIKeysFile, app.apiKeys)
+	key := r.PathValue("key")
+	if app.envAPIKeys[key] {
+		writeError(w, http.StatusBadRequest, "环境变量注入 Key 不能在面板删除，请移除对应环境变量后重启服务")
+		return
+	}
+	delete(app.apiKeys, key)
+	delete(app.managedAPIKeys, key)
+	_ = saveAPIKeys(app.settings.APIKeysFile, app.managedAPIKeys)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
